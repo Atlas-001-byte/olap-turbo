@@ -3,9 +3,9 @@
 Supported grammar (the complete surface for this baseline)::
 
     query      := SELECT select_list FROM identifier
-                  [ WHERE conjunction ] [ GROUP BY identifier ]
-    select_list:= grouping_column, count_star, sum_expr (, sum_expr)*
-                                               (grouped aggregate query)
+                  [ WHERE conjunction ] [ GROUP BY identifier (, identifier)* ]
+    select_list:= grouping_column (, grouping_column)*, count_star,
+                  sum_expr (, sum_expr)*        (grouped aggregate query)
                 | count_star [, sum_expr ]*     (aggregate query)
                 | column (, column)*            (projection query)
     conjunction:= comparison (AND comparison)*
@@ -13,9 +13,10 @@ Supported grammar (the complete surface for this baseline)::
     op         := = | != | > | >= | < | <=
     value      := number-literal | double-quoted-string-literal
 
-A grouped query names exactly one grouping column: it must be the first
-SELECT item, it must match the GROUP BY column, and it is followed by
-count(*) and one or more distinct sum(column) expressions.
+A grouped query names one or more distinct grouping columns: they must
+lead the SELECT list in the same order as the GROUP BY list, and they
+are followed by count(*) and one or more distinct sum(column)
+expressions.
 
 Anything else (missing FROM, OR, functions other than count(*)/sum(),
 wildcards, extra clauses, malformed syntax) raises :class:`ValueError`.
@@ -156,7 +157,7 @@ class Query:
     select: Tuple[SelectItem, ...]
     table: str
     where: Tuple[Comparison, ...]
-    group_by: Optional[str] = None
+    group_by: Optional[Tuple[str, ...]] = None
 
     @property
     def is_aggregate(self) -> bool:
@@ -214,7 +215,7 @@ class _Parser:
         if table_tok.kind is not _TokKind.IDENT:
             raise ValueError("table name must be a simple identifier")
         where: List[Comparison] = []
-        group_by: Optional[str] = None
+        group_by: Optional[Tuple[str, ...]] = None
         tok = self._peek()
         if tok.kind is _TokKind.KEYWORD and tok.text == "WHERE":
             self._next()
@@ -223,8 +224,13 @@ class _Parser:
         if tok.kind is _TokKind.KEYWORD and tok.text == "GROUP":
             self._next()
             self._expect_keyword("BY")
-            group_tok = self._expect(_TokKind.IDENT)
-            group_by = group_tok.text
+            group_cols = [self._expect(_TokKind.IDENT).text]
+            while self._peek().kind is _TokKind.COMMA:
+                self._next()
+                group_cols.append(self._expect(_TokKind.IDENT).text)
+            if len(set(group_cols)) != len(group_cols):
+                raise ValueError("GROUP BY columns must be distinct")
+            group_by = tuple(group_cols)
             self._validate_grouped(items, group_by)
             tok = self._peek()
         else:
@@ -236,25 +242,33 @@ class _Parser:
         return Query(tuple(items), table_tok.text, tuple(where), group_by)
 
     def _validate_grouped(
-        self, items: List[SelectItem], group_by: str
+        self, items: List[SelectItem], group_by: Tuple[str, ...]
     ) -> None:
-        """Enforce the grouped shape: key, count(*), one+ distinct sums."""
-        first = items[0]
-        if first.kind != "column" or first.column != group_by:
+        """Enforce the grouped shape: keys in GROUP BY order, count(*),
+        then one or more distinct sums."""
+        n_keys = len(group_by)
+        if len(items) < n_keys + 2:
             raise ValueError(
-                "GROUP BY column must be the first SELECT item and match "
-                "the GROUP BY column"
+                "grouped SELECT must list the grouping columns followed by "
+                "count(*) and one or more sum(column)"
             )
-        if len(items) < 3 or items[1].kind != "count_star":
+        for pos, column in enumerate(group_by):
+            item = items[pos]
+            if item.kind != "column" or item.column != column:
+                raise ValueError(
+                    "grouped SELECT must lead with the GROUP BY columns "
+                    "in the same order"
+                )
+        if items[n_keys].kind != "count_star":
             raise ValueError(
-                "grouped SELECT must be the grouping column followed by "
+                "grouped SELECT must list the grouping columns followed by "
                 "count(*) and one or more sum(column)"
             )
         seen_sums = set()
-        for item in items[2:]:
+        for item in items[n_keys + 1:]:
             if item.kind != "sum":
                 raise ValueError(
-                    "grouped SELECT may only contain the grouping column, "
+                    "grouped SELECT may only contain the grouping columns, "
                     "count(*) and sum(column)"
                 )
             if item.column in seen_sums:

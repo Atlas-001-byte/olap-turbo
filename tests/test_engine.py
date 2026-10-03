@@ -297,6 +297,222 @@ def test_bad_grouped_sql_raises_valueerror(tmp_path, sql):
         execute(str(tmp_path), sql)
 
 
+# ---------- multi-column grouped aggregate queries ----------
+
+@pytest.fixture()
+def multi_dir(tmp_path: Path) -> Path:
+    (tmp_path / "sales.csv").write_text(
+        "region,channel,amount,qty\n"
+        "east,web,10,1\n"
+        "east,store,20.5,2\n"
+        "west,web,5,3\n"
+        "east,web,1.5,4\n"
+        "west,store,abc,5\n"
+        "east,store,3,6\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_multi_group_basic_shape_and_order(multi_dir):
+    result = execute(
+        str(multi_dir),
+        "SELECT region, channel, count(*), sum(amount), sum(qty) FROM sales "
+        "WHERE qty != 5 GROUP BY region, channel",
+    )
+    assert result["columns"] == ["region", "channel", "count(*)", "sum(amount)", "sum(qty)"]
+    # Composite keys in first-appearance order over the filtered stream.
+    assert result["rows"] == [
+        ["east", "web", 2, 11.5, 5],
+        ["east", "store", 2, 23.5, 8],
+        ["west", "web", 1, 5, 3],
+    ]
+    assert result["row_count"] == 3
+
+
+def test_multi_group_three_columns(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "a,b,c,v\n"
+        "x,1,north,1\n"
+        "x,1,south,2\n"
+        "x,1,north,4\n"
+        "y,1,north,8\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT a, b, c, count(*), sum(v) FROM t GROUP BY a, b, c",
+    )
+    assert result["rows"] == [
+        ["x", 1, "north", 2, 5],
+        ["x", 1, "south", 1, 2],
+        ["y", 1, "north", 1, 8],
+    ]
+    assert result["row_count"] == 3
+
+
+def test_multi_group_decimal_keys_coalesce_per_position(tmp_path):
+    # Each key position coalesces finite decimals independently; text stays text.
+    (tmp_path / "t.csv").write_text(
+        "k1,k2,v\n"
+        "1,1.0,1\n"
+        "1.0,1,2\n"
+        "01,1,4\n"
+        "1,x,8\n"
+        "x,1,16\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT k1, k2, count(*), sum(v) FROM t GROUP BY k1, k2",
+    )
+    assert result["rows"] == [
+        [1, 1, 3, 7],
+        [1, "x", 1, 8],
+        ["x", 1, 1, 16],
+    ]
+    assert render(result) == (
+        '{"columns":["k1","k2","count(*)","sum(v)"],"rows":'
+        '[[1,1,3,7],[1,"x",1,8],["x",1,1,16]],"row_count":3}'
+    )
+
+
+def test_multi_group_where_and_filters_first(multi_dir):
+    result = execute(
+        str(multi_dir),
+        'SELECT region, channel, count(*), sum(qty) FROM sales '
+        'WHERE qty >= 2 AND channel != "store" GROUP BY region, channel',
+    )
+    assert result["rows"] == [["west", "web", 1, 3], ["east", "web", 1, 4]]
+
+
+def test_multi_group_empty_results(tmp_path):
+    (tmp_path / "e.csv").write_text("a,b,v\n", encoding="utf-8")
+    result = execute(str(tmp_path), "SELECT a, b, count(*), sum(v) FROM e GROUP BY a, b")
+    assert result == {
+        "columns": ["a", "b", "count(*)", "sum(v)"],
+        "rows": [],
+        "row_count": 0,
+    }
+    (tmp_path / "t.csv").write_text("a,b,v\nx,y,1\n", encoding="utf-8")
+    result = execute(
+        str(tmp_path),
+        "SELECT a, b, count(*), sum(v) FROM t WHERE v > 100 GROUP BY a, b",
+    )
+    assert result["rows"] == []
+    assert result["row_count"] == 0
+
+
+def test_multi_group_sum_non_number_only_on_matching_rows(multi_dir):
+    # Row with amount="abc" is excluded by WHERE, so grouping succeeds.
+    result = execute(
+        str(multi_dir),
+        'SELECT region, channel, count(*), sum(amount) FROM sales '
+        'WHERE channel != "store" GROUP BY region, channel',
+    )
+    assert result["rows"] == [["east", "web", 2, 11.5], ["west", "web", 1, 5]]
+    with pytest.raises(ValueError):
+        execute(
+            str(multi_dir),
+            "SELECT region, channel, count(*), sum(amount) FROM sales "
+            "GROUP BY region, channel",
+        )
+
+
+def test_multi_group_unknown_column_raises_keyerror(multi_dir):
+    with pytest.raises(KeyError):
+        execute(
+            str(multi_dir),
+            "SELECT region, missing, count(*), sum(qty) FROM sales "
+            "GROUP BY region, missing",
+        )
+    with pytest.raises(KeyError):
+        execute(
+            str(multi_dir),
+            "SELECT region, channel, count(*), sum(missing) FROM sales "
+            "GROUP BY region, channel",
+        )
+    with pytest.raises(KeyError):
+        execute(
+            str(multi_dir),
+            "SELECT region, channel, count(*), sum(qty) FROM sales "
+            "WHERE missing = 1 GROUP BY region, channel",
+        )
+
+
+def test_multi_group_across_batches(tmp_path):
+    n = BATCH_SIZE * 2 + 7
+    lines = ["g1,g2,v\n"]
+    for i in range(n):
+        lines.append(f"{'ab'[i % 2]},{i % 3},{i}\n")
+    (tmp_path / "big.csv").write_text("".join(lines), encoding="utf-8")
+    result = execute(
+        str(tmp_path),
+        "SELECT g1, g2, count(*), sum(v) FROM big GROUP BY g1, g2",
+    )
+    assert [tuple(r[:2]) for r in result["rows"]] == [
+        ("a", 0), ("b", 1), ("a", 2), ("b", 0), ("a", 1), ("b", 2),
+    ]
+    assert result["row_count"] == 6
+    total = sum(r[2] for r in result["rows"])
+    assert total == n
+    assert sum(r[3] for r in result["rows"]) == sum(range(n))
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # SELECT must list every GROUP BY column, in order, up front
+        "SELECT a, count(*), sum(v) FROM t GROUP BY a, b",              # missing column
+        "SELECT b, a, count(*), sum(v) FROM t GROUP BY a, b",           # wrong order
+        "SELECT a, a, count(*), sum(v) FROM t GROUP BY a, a",           # repeated key
+        "SELECT a, count(*), b, sum(v) FROM t GROUP BY a, b",           # key among aggregates
+        "SELECT a, b, count(*), sum(v) FROM t GROUP BY a, a",           # GROUP BY duplicate
+        # count(*) then one or more distinct sum(column), nothing else
+        "SELECT a, b, sum(v) FROM t GROUP BY a, b",                     # no count(*)
+        "SELECT a, b, count(*) FROM t GROUP BY a, b",                   # no sum
+        "SELECT a, b, count(*), count(*) FROM t GROUP BY a, b",         # extra count
+        "SELECT a, b, count(*), avg(v) FROM t GROUP BY a, b",           # other function
+        "SELECT a, b, count(*), sum(v), sum(v) FROM t GROUP BY a, b",   # duplicate sum
+        "SELECT a, b, c, count(*), sum(v) FROM t GROUP BY a, b",        # extra plain column
+        "SELECT count(*), sum(v) FROM t GROUP BY a, b",                 # no keys in SELECT
+        # trailing clauses still rejected
+        "SELECT a, b, count(*), sum(v) FROM t GROUP BY a, b ORDER BY a",
+        "SELECT a, b, count(*), sum(v) FROM t GROUP BY a, b HAVING count(*) > 1",
+        "SELECT a, b, count(*), sum(v) FROM t GROUP BY a,",
+    ],
+)
+def test_bad_multi_group_sql_raises_valueerror(tmp_path, sql):
+    (tmp_path / "t.csv").write_text("a,b,c,v\n1,2,3,4\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        execute(str(tmp_path), sql)
+
+
+def test_multi_group_cli(multi_dir):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "olap_turbo",
+            "--data-dir",
+            str(multi_dir),
+            "--query",
+            "SELECT region, channel, count(*), sum(qty) FROM sales "
+            "WHERE qty <= 3 GROUP BY region, channel",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(proc.stdout)
+    assert payload == {
+        "columns": ["region", "channel", "count(*)", "sum(qty)"],
+        "rows": [["east", "web", 1, 1], ["east", "store", 1, 2], ["west", "web", 1, 3]],
+        "row_count": 3,
+    }
+
+
 # ---------- column pruning ----------
 
 def test_unreferenced_garbage_column_is_ignored(tmp_path):
