@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -109,6 +110,191 @@ def test_sum_integer_stays_integer_json(data_dir):
 def test_aggregate_without_where(data_dir):
     result = execute(str(data_dir), "SELECT count(*), sum(id) FROM sales")
     assert result["rows"] == [[5, 15]]
+
+
+# ---------- grouped aggregate queries ----------
+
+def test_group_basic_shape_and_order(data_dir):
+    # Row 4's amount is "abc", so filter it out; "east" first appears
+    # before "west" in CSV order.
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(amount), sum(id) FROM sales "
+        "WHERE id != 4 GROUP BY region",
+    )
+    assert result["columns"] == ["region", "count(*)", "sum(amount)", "sum(id)"]
+    assert result["rows"] == [["east", 2, 40, 4], ["west", 2, 18.25, 7]]
+    assert result["row_count"] == 2
+
+
+def test_group_where_filters_before_grouping(data_dir):
+    result = execute(
+        str(data_dir),
+        'SELECT region, count(*), sum(id) FROM sales WHERE id >= 3 GROUP BY region',
+    )
+    # east: rows 3,4 ; west: row 5
+    assert result["rows"] == [["east", 2, 7], ["west", 1, 5]]
+    assert result["row_count"] == 2
+
+
+def test_group_decimal_keys_coalesce(tmp_path):
+    # 1, 1.0 and 01 are the same finite decimal; x and 1.10 are distinct.
+    (tmp_path / "t.csv").write_text(
+        "k,v\n1,1\n1.0,2\n01,4\nx,3\n1.10,5\n",
+        encoding="utf-8",
+    )
+    result = execute(str(tmp_path), "SELECT k, count(*), sum(v) FROM t GROUP BY k")
+    assert result["columns"] == ["k", "count(*)", "sum(v)"]
+    # First appearance order: decimal 1 (from "1"), text "x", decimal 1.10.
+    assert result["rows"] == [[1, 3, 7], ["x", 1, 3], [Decimal("1.10"), 1, 5]]
+    assert result["row_count"] == 3
+    # The coalesced key renders as an integer; the non-integral key keeps
+    # its exact decimal text, never a binary-float artifact like 1.1000000.
+    assert render(result) == (
+        '{"columns":["k","count(*)","sum(v)"],"rows":[[1,3,7],["x",1,3],'
+        '[1.10,1,5]],"row_count":3}'
+    )
+
+
+def test_group_text_keys_stay_strings(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "g,v\neast,1\nwest,2\neast,3\n",
+        encoding="utf-8",
+    )
+    result = execute(str(tmp_path), "SELECT g, count(*), sum(v) FROM t GROUP BY g")
+    assert result["rows"] == [["east", 2, 4], ["west", 1, 2]]
+
+
+def test_group_empty_where_match(data_dir):
+    result = execute(
+        str(data_dir),
+        'SELECT region, count(*), sum(id) FROM sales WHERE id > 100 GROUP BY region',
+    )
+    assert result["columns"] == ["region", "count(*)", "sum(id)"]
+    assert result["rows"] == []
+    assert result["row_count"] == 0
+
+
+def test_group_empty_table(tmp_path):
+    (tmp_path / "e.csv").write_text("k,v\n", encoding="utf-8")
+    result = execute(str(tmp_path), "SELECT k, count(*), sum(v) FROM e GROUP BY k")
+    assert result == {"columns": ["k", "count(*)", "sum(v)"], "rows": [], "row_count": 0}
+
+
+def test_group_sum_integer_and_decimal_json(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "g,v\na,1\na,2.5\nb,10\n",
+        encoding="utf-8",
+    )
+    result = execute(str(tmp_path), "SELECT g, count(*), sum(v) FROM t GROUP BY g")
+    assert render(result) == (
+        '{"columns":["g","count(*)","sum(v)"],"rows":[["a",2,3.5],["b",1,10]],'
+        '"row_count":2}'
+    )
+
+
+def test_group_unreferenced_column_ignored(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "g,v,noise\na,1,garbage###\nb,2,not-a-number\n",
+        encoding="utf-8",
+    )
+    result = execute(str(tmp_path), "SELECT g, count(*), sum(v) FROM t GROUP BY g")
+    assert result["rows"] == [["a", 1, 1], ["b", 1, 2]]
+    # The WHERE column is read, but an unreferenced garbage column is not.
+    result = execute(
+        str(tmp_path),
+        'SELECT g, count(*), sum(v) FROM t WHERE g = "a" GROUP BY g',
+    )
+    assert result["rows"] == [["a", 1, 1]]
+
+
+def test_group_sum_non_number_only_on_matching_rows(data_dir):
+    # Row 4 has amount="abc"; excluded by WHERE, so grouping succeeds.
+    result = execute(
+        str(data_dir),
+        'SELECT region, count(*), sum(amount) FROM sales WHERE id != 4 GROUP BY region',
+    )
+    assert result["rows"] == [["east", 2, 40], ["west", 2, 18.25]]
+    with pytest.raises(ValueError):
+        execute(
+            str(data_dir),
+            "SELECT region, count(*), sum(amount) FROM sales GROUP BY region",
+        )
+
+
+def test_group_text_key_never_numeric_coerced(data_dir):
+    # Grouping by a text column must never raise, even without WHERE.
+    result = execute(
+        str(data_dir), "SELECT region, count(*), sum(id) FROM sales GROUP BY region"
+    )
+    assert result["row_count"] == 2
+
+
+def test_grouped_unknown_column_raises_keyerror(data_dir):
+    with pytest.raises(KeyError):
+        execute(
+            str(data_dir),
+            "SELECT missing, count(*), sum(id) FROM sales GROUP BY missing",
+        )
+    with pytest.raises(KeyError):
+        execute(
+            str(data_dir),
+            "SELECT region, count(*), sum(missing) FROM sales GROUP BY region",
+        )
+
+
+def test_grouping_across_batches(tmp_path):
+    n = BATCH_SIZE * 2 + 7
+    lines = ["g,v\n"]
+    for i in range(n):
+        # Alternate keys so each key's rows span multiple batches.
+        lines.append(f"{'ab'[i % 2]},{i}\n")
+    (tmp_path / "big.csv").write_text("".join(lines), encoding="utf-8")
+    result = execute(str(tmp_path), "SELECT g, count(*), sum(v) FROM big GROUP BY g")
+    assert [r[0] for r in result["rows"]] == ["a", "b"]
+    counts = {r[0]: r[1] for r in result["rows"]}
+    assert counts == {"a": (n + 1) // 2, "b": n // 2}
+    assert result["row_count"] == 2
+    # Sums over alternating evens/odds must be exact decimals rendered ints.
+    sums = {r[0]: r[2] for r in result["rows"]}
+    expected_sum = sum(range(0, n, 2))
+    assert sums["a"] == expected_sum
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # GROUP BY with the projection shape is still invalid.
+        "SELECT a FROM t GROUP BY a",
+        # grouping column must lead the SELECT list and match GROUP BY
+        "SELECT b, count(*), sum(a) FROM t GROUP BY a",
+        "SELECT a, count(*), sum(a) FROM t GROUP BY b",
+        # count(*) must follow the grouping column
+        "SELECT a, sum(b), count(*) FROM t GROUP BY a",
+        # at least one sum is required
+        "SELECT a, count(*) FROM t GROUP BY a",
+        # only sum() aggregates, no duplicates
+        "SELECT a, count(*), count(*) FROM t GROUP BY a",
+        "SELECT a, count(*), avg(b) FROM t GROUP BY a",
+        "SELECT a, count(*), sum(b), sum(b) FROM t GROUP BY a",
+        # aggregate shape without a leading grouping column
+        "SELECT count(*), sum(a) FROM t GROUP BY a",
+        # clauses other than WHERE/GROUP BY
+        "SELECT a, count(*), sum(b) FROM t GROUP BY a ORDER BY a",
+        "SELECT a, count(*), sum(b) FROM t GROUP BY a HAVING count(*) > 1",
+        # GROUP BY with multiple columns / missing column
+        "SELECT a, count(*), sum(b) FROM t GROUP BY",
+        "SELECT a, count(*), sum(b) FROM t GROUP BY a, b",
+        # non-AND conditions remain rejected in grouped queries
+        "SELECT a, count(*), sum(b) FROM t WHERE x = 1 OR y = 2 GROUP BY a",
+    ],
+)
+def test_bad_grouped_sql_raises_valueerror(tmp_path, sql):
+    (tmp_path / "t.csv").write_text(
+        "a,b,x,y\n1,2,1,2\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError):
+        execute(str(tmp_path), sql)
 
 
 # ---------- column pruning ----------

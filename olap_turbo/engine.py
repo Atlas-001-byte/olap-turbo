@@ -2,9 +2,11 @@
 
 The scanner reads each CSV table in record batches of at most
 :data:`BATCH_SIZE` rows, materializing only the columns referenced by the
-SELECT list or the WHERE clause (column pruning). Within a batch the
-predicate is evaluated column-at-a-time *before* projection (predicate
-pushdown), and aggregates roll forward batch by batch.
+SELECT list, the GROUP BY key or the WHERE clause (column pruning).
+Within a batch the predicate is evaluated column-at-a-time *before*
+projection or grouping (predicate pushdown), and aggregates — either a
+single global row or per-group hash tables keyed by the GROUP BY column
+— roll forward batch by batch.
 
 All arithmetic and numeric comparison go through :class:`decimal.Decimal`
 so results are deterministic and free of binary-float artifacts.
@@ -101,6 +103,28 @@ def _number(value: Decimal) -> Any:
     return value
 
 
+def _group_key(field: str) -> Any:
+    """Normalize a grouping cell.
+
+    Finite decimal text groups by exact decimal value (so ``1`` and
+    ``1.0`` share a group); everything else groups by raw text.
+    """
+    try:
+        value = Decimal(field)
+    except (InvalidOperation, ValueError):
+        return field
+    if not value.is_finite():
+        return field
+    return value
+
+
+def _key_output(key: Any) -> Any:
+    """Render a grouping key for JSON: numeric keys follow projection rules."""
+    if isinstance(key, Decimal):
+        return _number(key)
+    return key
+
+
 def _aggregate_result(query: Query, count: int, sums: Dict[str, Decimal]) -> Dict[str, Any]:
     row: List[Any] = []
     for item in query.select:
@@ -112,6 +136,30 @@ def _aggregate_result(query: Query, count: int, sums: Dict[str, Decimal]) -> Dic
         "columns": [item.text for item in query.select],
         "rows": [row],
         "row_count": 1,
+    }
+
+
+def _grouped_result(
+    query: Query,
+    order: List[Any],
+    counts: Dict[Any, int],
+    sums: Dict[Any, Dict[str, Decimal]],
+) -> Dict[str, Any]:
+    rows: List[List[Any]] = []
+    for key in order:
+        row: List[Any] = []
+        for item in query.select:
+            if item.kind == "column":
+                row.append(_key_output(key))
+            elif item.kind == "count_star":
+                row.append(counts[key])
+            else:
+                row.append(_number(sums[key][item.column]))
+        rows.append(row)
+    return {
+        "columns": [item.text for item in query.select],
+        "rows": rows,
+        "row_count": len(rows),
     }
 
 
@@ -130,6 +178,38 @@ def _run_batches(
         if item.kind == "sum"
     }
     select_cols: Tuple[SelectItem, ...] = query.select
+
+    if query.is_grouped:
+        # First-appearance order of group keys over the filtered row stream.
+        order: List[Any] = []
+        group_counts: Dict[Any, int] = {}
+        group_sums: Dict[Any, Dict[str, Decimal]] = {}
+        group_col = query.group_by
+        group_idx = col_index[group_col]
+        sum_items = [item for item in select_cols if item.kind == "sum"]
+
+        while True:
+            batch = [row for _, row in zip(range(BATCH_SIZE), reader)]
+            if not batch:
+                break
+            mask = _evaluate_predicate(batch, col_index, query.where)
+            for i, matched in enumerate(mask):
+                if not matched:
+                    continue
+                row = batch[i]
+                field = row[group_idx] if group_idx < len(row) else ""
+                key = _group_key(field)
+                if key not in group_counts:
+                    group_counts[key] = 0
+                    group_sums[key] = {item.column: Decimal(0) for item in sum_items}
+                    order.append(key)
+                group_counts[key] += 1
+                for item in sum_items:
+                    idx = col_index[item.column]
+                    sum_field = row[idx] if idx < len(row) else ""
+                    group_sums[key][item.column] += _decimal(sum_field, item.column)
+
+        return _grouped_result(query, order, group_counts, group_sums)
 
     while True:
         batch = [row for _, row in zip(range(BATCH_SIZE), reader)]
