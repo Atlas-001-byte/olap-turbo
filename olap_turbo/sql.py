@@ -3,15 +3,18 @@
 Supported grammar (the complete surface for this baseline)::
 
     query      := SELECT select_list FROM identifier [ WHERE conjunction ]
+                  [ GROUP BY identifier ]
     select_list:= count_star [, sum_expr ]*          (aggregate query)
                 | column (, column)*                 (projection query)
+                | column, count_star [, sum_expr ]*  (GROUP BY query; the
+                  column must be the GROUP BY column, exactly once)
     conjunction:= comparison (AND comparison)*
     comparison := identifier op value
     op         := = | != | > | >= | < | <=
     value      := number-literal | double-quoted-string-literal
 
 Anything else (missing FROM, OR, functions, wildcards, extra clauses,
-malformed syntax) raises :class:`ValueError`.
+duplicate aggregates, malformed syntax) raises :class:`ValueError`.
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ class _TokKind(Enum):
     EOF = "eof"
 
 
-_KEYWORDS = {"SELECT", "FROM", "WHERE", "AND"}
+_KEYWORDS = {"SELECT", "FROM", "WHERE", "AND", "GROUP", "BY"}
 
 
 @dataclass
@@ -149,10 +152,11 @@ class Query:
     select: Tuple[SelectItem, ...]
     table: str
     where: Tuple[Comparison, ...]
+    group_by: Optional[str] = None
 
     @property
     def is_aggregate(self) -> bool:
-        return self.select[0].kind == "count_star"
+        return any(item.kind == "count_star" for item in self.select)
 
     def required_columns(self) -> Tuple[str, ...]:
         """Columns the scan must materialize (projection + predicates)."""
@@ -170,6 +174,9 @@ class Query:
             if comp.column not in seen:
                 seen.add(comp.column)
                 cols.append(comp.column)
+        if self.group_by is not None and self.group_by not in seen:
+            seen.add(self.group_by)
+            cols.append(self.group_by)
         return tuple(cols)
 
 
@@ -207,21 +214,54 @@ class _Parser:
             self._next()
             where = self._parse_where()
             tok = self._peek()
+        group_by: Optional[str] = None
+        if tok.kind is _TokKind.KEYWORD and tok.text == "GROUP":
+            self._next()
+            self._expect_keyword("BY")
+            group_tok = self._next()
+            if group_tok.kind is not _TokKind.IDENT:
+                raise ValueError("GROUP BY column must be a simple identifier")
+            group_by = group_tok.text
+            tok = self._peek()
         if tok.kind is not _TokKind.EOF:
-            # Trailing tokens: unsupported clause (GROUP BY, ORDER BY, OR ...)
+            # Trailing tokens: unsupported clause (ORDER BY, OR, ...)
             # or plain malformed input.
             raise ValueError(f"unsupported or unexpected token {tok.text!r}")
-        return Query(tuple(items), table_tok.text, tuple(where))
+        self._validate_select_list(items, group_by)
+        return Query(tuple(items), table_tok.text, tuple(where), group_by)
 
-    def _parse_select_list(self) -> List[SelectItem]:
-        first = self._parse_select_item()
+    @staticmethod
+    def _validate_select_list(items: List[SelectItem], group_by: Optional[str]) -> None:
+        if group_by is not None:
+            # GROUP BY shape: <group column>, count(*) [, sum(column) ...]
+            # with the group column appearing exactly once and no duplicate
+            # aggregates.
+            if (
+                len(items) < 2
+                or items[0].kind != "column"
+                or items[0].column != group_by
+                or items[1].kind != "count_star"
+            ):
+                raise ValueError(
+                    "GROUP BY queries must select the group column, then "
+                    "count(*), then optional sum(column) aggregates"
+                )
+            seen_sums = set()
+            for item in items[2:]:
+                if item.kind != "sum":
+                    raise ValueError(
+                        "GROUP BY SELECT may only contain the group column, "
+                        "count(*) and sum(column)"
+                    )
+                if item.column in seen_sums:
+                    raise ValueError(f"duplicate aggregate sum({item.column})")
+                seen_sums.add(item.column)
+            return
+        first = items[0]
         if first.kind == "sum":
             raise ValueError("sum(column) requires count(*) in the SELECT list")
-        items = [first]
         aggregate = first.kind == "count_star"
-        while self._peek().kind is _TokKind.COMMA:
-            self._next()
-            item = self._parse_select_item()
+        for item in items[1:]:
             if aggregate:
                 if item.kind != "sum":
                     raise ValueError(
@@ -233,7 +273,12 @@ class _Parser:
                 raise ValueError(
                     "count(*)/sum() cannot be mixed with plain columns"
                 )
-            items.append(item)
+
+    def _parse_select_list(self) -> List[SelectItem]:
+        items = [self._parse_select_item()]
+        while self._peek().kind is _TokKind.COMMA:
+            self._next()
+            items.append(self._parse_select_item())
         return items
 
     def _parse_select_item(self) -> SelectItem:

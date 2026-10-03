@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -140,6 +141,123 @@ def test_batches_larger_than_batch_size(tmp_path):
     assert result["rows"][-1] == [n - 1]
     agg = execute(str(tmp_path), "SELECT count(*), sum(v) FROM big WHERE k < 10")
     assert agg["rows"] == [[10, 45]]
+
+
+# ---------- group by ----------
+
+def test_group_by_basic(data_dir):
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(amount) FROM sales WHERE id != 4 GROUP BY region",
+    )
+    assert result["columns"] == ["region", "count(*)", "sum(amount)"]
+    # First-appearance order in the filtered CSV rows: east (row 1), west (row 2).
+    assert result["rows"] == [["east", 2, 40], ["west", 2, 18.25]]
+    assert result["row_count"] == 2
+
+
+def test_group_by_count_only(data_dir):
+    result = execute(str(data_dir), "SELECT region, count(*) FROM sales GROUP BY region")
+    assert result["columns"] == ["region", "count(*)"]
+    assert result["rows"] == [["east", 3], ["west", 2]]
+
+
+def test_group_by_first_appearance_order(data_dir):
+    result = execute(str(data_dir), "SELECT note, count(*) FROM sales WHERE id >= 2 GROUP BY note")
+    assert [r[0] for r in result["rows"]] == ["b", "", "x", "y"]
+
+
+def test_group_by_numeric_keys_merge(data_dir):
+    # 1 and 1.0 are the same decimal value, so they share a group; the key
+    # renders as a JSON integer under the projection rules.
+    (data_dir / "nums.csv").write_text(
+        "k,v\n1,10\n1.0,20\n2,30\n1.00,40\n",
+        encoding="utf-8",
+    )
+    result = execute(str(data_dir), "SELECT k, count(*), sum(v) FROM nums GROUP BY k")
+    assert result["rows"] == [[1, 3, 70], [2, 1, 30]]
+    assert render(result) == '{"columns":["k","count(*)","sum(v)"],"rows":[[1,3,70],[2,1,30]],"row_count":2}'
+
+
+def test_group_by_non_integer_key_and_sum(data_dir):
+    (data_dir / "frac.csv").write_text(
+        "k,v\n1.5,0.1\nx,2\n1.50,0.2\n",
+        encoding="utf-8",
+    )
+    result = execute(str(data_dir), "SELECT k, count(*), sum(v) FROM frac GROUP BY k")
+    assert result["rows"] == [[Decimal("1.5"), 2, Decimal("0.3")], ["x", 1, 2]]
+    assert render(result) == '{"columns":["k","count(*)","sum(v)"],"rows":[[1.5,2,0.3],["x",1,2]],"row_count":2}'
+
+
+def test_group_by_empty_result(data_dir):
+    result = execute(str(data_dir), "SELECT region, count(*) FROM sales WHERE id > 100 GROUP BY region")
+    assert result == {"columns": ["region", "count(*)"], "rows": [], "row_count": 0}
+
+
+def test_group_by_unreferenced_column_ignored(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "g,a,noise\n"
+        "x,1,not-a-number!!!\n"
+        "y,2,####\n"
+        "x,3,???\n",
+        encoding="utf-8",
+    )
+    result = execute(str(tmp_path), "SELECT g, count(*), sum(a) FROM t GROUP BY g")
+    assert result["rows"] == [["x", 2, 4], ["y", 1, 2]]
+
+
+def test_group_by_sum_rejects_non_number(data_dir):
+    with pytest.raises(ValueError):
+        execute(str(data_dir), "SELECT region, count(*), sum(amount) FROM sales GROUP BY region")
+    # Row 4 (amount="abc") is filtered out, so the sum succeeds.
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(amount) FROM sales WHERE id != 4 GROUP BY region",
+    )
+    assert result["rows"][0] == ["east", 2, 40]
+
+
+def test_group_by_spans_batches(tmp_path):
+    n = BATCH_SIZE * 2 + 7
+    (tmp_path / "big.csv").write_text(
+        "g,v\n" + "".join(f"{'even' if i % 2 == 0 else 'odd'},{i}\n" for i in range(n)),
+        encoding="utf-8",
+    )
+    result = execute(str(tmp_path), "SELECT g, count(*), sum(v) FROM big GROUP BY g")
+    evens = sum(range(0, n, 2))
+    odds = sum(range(1, n, 2))
+    assert result["rows"] == [
+        ["even", len(range(0, n, 2)), evens],
+        ["odd", len(range(1, n, 2)), odds],
+    ]
+
+
+def test_group_by_unknown_column_raises_keyerror(data_dir):
+    with pytest.raises(KeyError):
+        execute(str(data_dir), "SELECT missing, count(*) FROM sales GROUP BY missing")
+    with pytest.raises(KeyError):
+        execute(str(data_dir), "SELECT region, count(*), sum(missing) FROM sales GROUP BY region")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a FROM sales GROUP BY a",                    # no aggregates
+        "SELECT region, sum(amount) FROM sales GROUP BY region",  # missing count(*)
+        "SELECT count(*), sum(id) FROM sales GROUP BY region",    # group column not selected
+        "SELECT id, count(*) FROM sales GROUP BY region",    # select/group mismatch
+        "SELECT region, count(*), note FROM sales GROUP BY region",  # extra plain column
+        "SELECT region, count(*), sum(id), sum(id) FROM sales GROUP BY region",  # duplicate aggregate
+        "SELECT region, count(*), count(*) FROM sales GROUP BY region",          # duplicate count
+        "SELECT region, region, count(*) FROM sales GROUP BY region",            # repeated group column
+        "SELECT region, count(*) FROM sales GROUP BY region ORDER BY region",    # trailing clause
+        "SELECT region, count(*) FROM sales GROUP BY",       # missing group column
+        "SELECT region, count(*) FROM sales GROUP BY 1",     # non-identifier key
+    ],
+)
+def test_bad_group_by_raises_valueerror(data_dir, sql):
+    with pytest.raises(ValueError):
+        execute(str(data_dir), sql)
 
 
 # ---------- error contract ----------

@@ -115,12 +115,73 @@ def _aggregate_result(query: Query, count: int, sums: Dict[str, Decimal]) -> Dic
     }
 
 
+def _group_key(field: str) -> Any:
+    """Group key for one cell: finite decimals compare numerically (so 1 and
+    1.0 share a group), everything else compares as raw text."""
+    return _project_value(field)
+
+
+def _run_grouped(
+    reader: csv.reader,
+    query: Query,
+    col_index: Dict[str, int],
+) -> Dict[str, Any]:
+    """Single-column GROUP BY: filters, then folds rows into groups keyed by
+    first appearance in filtered CSV order."""
+    group_idx = col_index[query.group_by]
+    sum_items = [item for item in query.select if item.kind == "sum"]
+    # Insertion-ordered: key -> [count, {sum column: running total}]
+    groups: Dict[Any, List[Any]] = {}
+
+    while True:
+        batch = [row for _, row in zip(range(BATCH_SIZE), reader)]
+        if not batch:
+            break
+        mask = _evaluate_predicate(batch, col_index, query.where)
+        for i, matched in enumerate(mask):
+            if not matched:
+                continue
+            row = batch[i]
+            field = row[group_idx] if group_idx < len(row) else ""
+            key = _group_key(field)
+            entry = groups.get(key)
+            if entry is None:
+                entry = [0, {item.column: Decimal(0) for item in sum_items}]
+                groups[key] = entry
+            entry[0] += 1
+            sums = entry[1]
+            for item in sum_items:
+                idx = col_index[item.column]
+                cell = row[idx] if idx < len(row) else ""
+                sums[item.column] += _decimal(cell, item.column)
+
+    rows: List[List[Any]] = []
+    for key, (count, sums) in groups.items():
+        out: List[Any] = []
+        for item in query.select:
+            if item.kind == "column":
+                out.append(key)
+            elif item.kind == "count_star":
+                out.append(count)
+            else:
+                out.append(_number(sums[item.column]))
+        rows.append(out)
+    return {
+        "columns": [item.text for item in query.select],
+        "rows": rows,
+        "row_count": len(rows),
+    }
+
+
 def _run_batches(
     reader: csv.reader,
     query: Query,
     header: Sequence[str],
 ) -> Dict[str, Any]:
     col_index = {name: header.index(name) for name in query.required_columns()}
+
+    if query.group_by is not None:
+        return _run_grouped(reader, query, col_index)
 
     projected_rows: List[List[Any]] = []
     count = 0
