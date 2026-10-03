@@ -261,6 +261,243 @@ def test_grouping_across_batches(tmp_path):
     assert sums["a"] == expected_sum
 
 
+# ---------- multi-column grouped aggregate queries ----------
+
+def test_multi_group_basic(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "region,prod,amount\n"
+        "east,a,1\n"      # (east,a) first
+        "west,b,2\n"      # (west,b)
+        "east,a,3\n"      # existing
+        "east,b,4\n"      # (east,b)
+        "west,a,5\n"      # (west,a)
+        "east,a,6\n",     # existing
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT region, prod, count(*), sum(amount) FROM t GROUP BY region, prod",
+    )
+    assert result["columns"] == ["region", "prod", "count(*)", "sum(amount)"]
+    assert result["rows"] == [
+        ["east", "a", 3, 10],
+        ["west", "b", 1, 2],
+        ["east", "b", 1, 4],
+        ["west", "a", 1, 5],
+    ]
+    assert result["row_count"] == 4
+
+
+def test_multi_group_with_where_and_multiple_sums(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "r,p,a,b\n"
+        "x,u,1,10\n"
+        "y,v,2,20\n"
+        "x,u,3,30\n"
+        "x,v,4,40\n"
+        "y,u,5,50\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT r, p, count(*), sum(a), sum(b) FROM t WHERE a >= 2 "
+        "GROUP BY r, p",
+    )
+    assert result["columns"] == ["r", "p", "count(*)", "sum(a)", "sum(b)"]
+    # (y,v) first among matches, then (x,u), then (x,v), then (y,u)
+    assert result["rows"] == [
+        ["y", "v", 1, 2, 20],
+        ["x", "u", 1, 3, 30],
+        ["x", "v", 1, 4, 40],
+        ["y", "u", 1, 5, 50],
+    ]
+    assert result["row_count"] == 4
+
+
+def test_multi_group_decimal_keys_coalesce_per_position(tmp_path):
+    # Each key position normalizes independently: 1/1.0 coalesce, and a
+    # decimal position is never equal to text "1".
+    (tmp_path / "t.csv").write_text(
+        "k1,k2,v\n"
+        "1,1.0,1\n"
+        "1.0,01,2\n"      # same composite key as row 1
+        "01,1,4\n"        # same composite key
+        "1,x,8\n"         # text second position: distinct group
+        "x,1,16\n"        # text first position: distinct group
+        "1.10,1,32\n",    # non-integral first position: distinct group
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path), "SELECT k1, k2, count(*), sum(v) FROM t GROUP BY k1, k2"
+    )
+    assert result["rows"] == [
+        [1, 1, 3, 7],
+        [1, "x", 1, 8],
+        ["x", 1, 1, 16],
+        [Decimal("1.10"), 1, 1, 32],
+    ]
+    assert result["row_count"] == 4
+    assert render(result) == (
+        '{"columns":["k1","k2","count(*)","sum(v)"],"rows":'
+        '[[1,1,3,7],[1,"x",1,8],["x",1,1,16],[1.10,1,1,32]],'
+        '"row_count":4}'
+    )
+
+
+def test_multi_group_empty_table_and_no_match(tmp_path):
+    (tmp_path / "e.csv").write_text("a,b,v\n", encoding="utf-8")
+    result = execute(
+        str(tmp_path),
+        "SELECT a, b, count(*), sum(v) FROM e GROUP BY a, b",
+    )
+    assert result == {
+        "columns": ["a", "b", "count(*)", "sum(v)"],
+        "rows": [],
+        "row_count": 0,
+    }
+    (tmp_path / "t.csv").write_text(
+        "a,b,v\n1,2,10\n", encoding="utf-8"
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT a, b, count(*), sum(v) FROM t WHERE v > 100 GROUP BY a, b",
+    )
+    assert result["rows"] == []
+    assert result["row_count"] == 0
+
+
+def test_multi_group_sum_non_number_only_matching_rows(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "a,b,v\n"
+        "1,x,10\n"
+        "2,y,abc\n"
+        "1,x,5\n",
+        encoding="utf-8",
+    )
+    # The bad sum cell belongs to a row filtered out by WHERE.
+    result = execute(
+        str(tmp_path),
+        'SELECT a, b, count(*), sum(v) FROM t WHERE b != "y" GROUP BY a, b',
+    )
+    assert result["rows"] == [[1, "x", 2, 15]]
+    with pytest.raises(ValueError):
+        execute(
+            str(tmp_path),
+            "SELECT a, b, count(*), sum(v) FROM t GROUP BY a, b",
+        )
+
+
+def test_multi_group_unreferenced_column_ignored(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "a,b,v,noise\n"
+        "1,x,1,garbage###\n"
+        "2,y,2,not-a-number\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT a, b, count(*), sum(v) FROM t GROUP BY a, b",
+    )
+    assert result["rows"] == [[1, "x", 1, 1], [2, "y", 1, 2]]
+
+
+def test_multi_group_unknown_column_raises_keyerror(tmp_path):
+    (tmp_path / "t.csv").write_text("a,b,v\n1,2,3\n", encoding="utf-8")
+    with pytest.raises(KeyError):
+        execute(
+            str(tmp_path),
+            "SELECT a, missing, count(*), sum(v) FROM t GROUP BY a, missing",
+        )
+    with pytest.raises(KeyError):
+        execute(
+            str(tmp_path),
+            "SELECT a, b, count(*), sum(missing) FROM t GROUP BY a, b",
+        )
+    with pytest.raises(KeyError):
+        execute(
+            str(tmp_path),
+            "SELECT a, b, count(*), sum(v) FROM t WHERE missing = 1 GROUP BY a, b",
+        )
+
+
+def test_multi_grouping_across_batches(tmp_path):
+    n = BATCH_SIZE * 2 + 7
+    lines = ["g,h,v\n"]
+    for i in range(n):
+        # Two independent alternating keys; rows of each of the four
+        # composites span multiple batches.
+        lines.append(f"{'ab'[i % 2]},{'CD'[i % 3 % 2]},{i}\n")
+    (tmp_path / "big.csv").write_text("".join(lines), encoding="utf-8")
+    result = execute(
+        str(tmp_path),
+        "SELECT g, h, count(*), sum(v) FROM big GROUP BY g, h",
+    )
+    assert result["row_count"] == 4
+    seen = {(r[0], r[1]): (r[2], r[3]) for r in result["rows"]}
+    total_count = sum(c for c, _ in seen.values())
+    assert total_count == n
+    total_sum = sum(s for _, s in seen.values())
+    assert total_sum == n * (n - 1) // 2
+    # First composite key in CSV order is ("a", "C").
+    assert (result["rows"][0][0], result["rows"][0][1]) == ("a", "C")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # SELECT must list every GROUP BY column, in the same order
+        "SELECT a, count(*), sum(x) FROM t GROUP BY a, b",
+        "SELECT b, a, count(*), sum(x) FROM t GROUP BY a, b",
+        "SELECT a, b, count(*), sum(x) FROM t GROUP BY b, a",
+        # GROUP BY columns must be distinct, both in GROUP BY and SELECT
+        "SELECT a, b, count(*), sum(x) FROM t GROUP BY a, a",
+        "SELECT a, a, count(*), sum(x) FROM t GROUP BY a, a",
+        # count(*) must follow the grouping columns
+        "SELECT a, b, sum(x), count(*) FROM t GROUP BY a, b",
+        "SELECT count(*), a, b, sum(x) FROM t GROUP BY a, b",
+        # at least one sum, and only non-grouping sum() aggregates
+        "SELECT a, b, count(*) FROM t GROUP BY a, b",
+        "SELECT a, b, count(*), avg(x) FROM t GROUP BY a, b",
+        "SELECT a, b, count(*), x, sum(y) FROM t GROUP BY a, b",
+        "SELECT a, b, count(*), sum(a) FROM t GROUP BY a, b",
+        "SELECT a, b, count(*), sum(b) FROM t GROUP BY a, b",
+        "SELECT a, b, count(*), sum(x), sum(x) FROM t GROUP BY a, b",
+        "SELECT a, b, count(*) FROM t GROUP BY a, b, c",
+        # three-column GROUP BY follows the same rules
+        "SELECT a, b, c, count(*), sum(a) FROM t GROUP BY a, b, c",
+        "SELECT a, b, count(*), sum(x) FROM t GROUP BY a, b, c",
+    ],
+)
+def test_bad_multi_grouped_sql_raises_valueerror(tmp_path, sql):
+    (tmp_path / "t.csv").write_text(
+        "a,b,c,x,y\n1,2,3,4,5\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError):
+        execute(str(tmp_path), sql)
+
+
+def test_three_column_grouping(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "a,b,c,v\n"
+        "1,x,p,1\n"
+        "1,x,q,2\n"
+        "1,x,p,4\n"
+        "2,x,p,8\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT a, b, c, count(*), sum(v) FROM t GROUP BY a, b, c",
+    )
+    assert result["columns"] == ["a", "b", "c", "count(*)", "sum(v)"]
+    assert result["rows"] == [
+        [1, "x", "p", 2, 5],
+        [1, "x", "q", 1, 2],
+        [2, "x", "p", 1, 8],
+    ]
+    assert result["row_count"] == 3
+
+
 @pytest.mark.parametrize(
     "sql",
     [
@@ -282,9 +519,10 @@ def test_grouping_across_batches(tmp_path):
         # clauses other than WHERE/GROUP BY
         "SELECT a, count(*), sum(b) FROM t GROUP BY a ORDER BY a",
         "SELECT a, count(*), sum(b) FROM t GROUP BY a HAVING count(*) > 1",
-        # GROUP BY with multiple columns / missing column
+        # GROUP BY without a column stays rejected; a multi-column GROUP BY
+        # whose SELECT list omits a grouping column is rejected too.
         "SELECT a, count(*), sum(b) FROM t GROUP BY",
-        "SELECT a, count(*), sum(b) FROM t GROUP BY a, b",
+        "SELECT a, count(*), sum(c) FROM t GROUP BY a, b",
         # non-AND conditions remain rejected in grouped queries
         "SELECT a, count(*), sum(b) FROM t WHERE x = 1 OR y = 2 GROUP BY a",
     ],

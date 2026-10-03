@@ -5,8 +5,8 @@ The scanner reads each CSV table in record batches of at most
 SELECT list, the GROUP BY key or the WHERE clause (column pruning).
 Within a batch the predicate is evaluated column-at-a-time *before*
 projection or grouping (predicate pushdown), and aggregates — either a
-single global row or per-group hash tables keyed by the GROUP BY column
-— roll forward batch by batch.
+single global row or per-group hash tables keyed by one GROUP BY column
+or a tuple of several GROUP BY columns — roll forward batch by batch.
 
 All arithmetic and numeric comparison go through :class:`decimal.Decimal`
 so results are deterministic and free of binary-float artifacts.
@@ -141,16 +141,18 @@ def _aggregate_result(query: Query, count: int, sums: Dict[str, Decimal]) -> Dic
 
 def _grouped_result(
     query: Query,
-    order: List[Any],
-    counts: Dict[Any, int],
-    sums: Dict[Any, Dict[str, Decimal]],
+    order: List[Tuple[Any, ...]],
+    counts: Dict[Tuple[Any, ...], int],
+    sums: Dict[Tuple[Any, ...], Dict[str, Decimal]],
 ) -> Dict[str, Any]:
+    group_cols = query.group_by
     rows: List[List[Any]] = []
     for key in order:
         row: List[Any] = []
-        for item in query.select:
-            if item.kind == "column":
-                row.append(_key_output(key))
+        for pos, item in enumerate(query.select):
+            if pos < len(group_cols):
+                # The leading SELECT items are the GROUP BY columns, in order.
+                row.append(_key_output(key[pos]))
             elif item.kind == "count_star":
                 row.append(counts[key])
             else:
@@ -180,12 +182,12 @@ def _run_batches(
     select_cols: Tuple[SelectItem, ...] = query.select
 
     if query.is_grouped:
-        # First-appearance order of group keys over the filtered row stream.
-        order: List[Any] = []
-        group_counts: Dict[Any, int] = {}
-        group_sums: Dict[Any, Dict[str, Decimal]] = {}
-        group_col = query.group_by
-        group_idx = col_index[group_col]
+        # First-appearance order of composite group keys over the
+        # filtered row stream.
+        order: List[Tuple[Any, ...]] = []
+        group_counts: Dict[Tuple[Any, ...], int] = {}
+        group_sums: Dict[Tuple[Any, ...], Dict[str, Decimal]] = {}
+        group_idxs = [col_index[name] for name in query.group_by]
         sum_items = [item for item in select_cols if item.kind == "sum"]
 
         while True:
@@ -197,8 +199,10 @@ def _run_batches(
                 if not matched:
                     continue
                 row = batch[i]
-                field = row[group_idx] if group_idx < len(row) else ""
-                key = _group_key(field)
+                key = tuple(
+                    _group_key(row[idx] if idx < len(row) else "")
+                    for idx in group_idxs
+                )
                 if key not in group_counts:
                     group_counts[key] = 0
                     group_sums[key] = {item.column: Decimal(0) for item in sum_items}
