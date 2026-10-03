@@ -17,9 +17,9 @@ from __future__ import annotations
 import csv
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .sql import Comparison, Query, SelectItem, parse_sql
+from .sql import And, Comparison, Condition, Or, Query, SelectItem, parse_sql
 
 BATCH_SIZE = 1024
 
@@ -60,27 +60,51 @@ def _column_vector(rows: Sequence[Sequence[str]], idx: int) -> List[str]:
     return vec
 
 
+def _comparison_mask(
+    rows: List[Sequence[str]],
+    col_index: Dict[str, int],
+    comp: Comparison,
+) -> List[bool]:
+    """Evaluate one comparison over the whole batch.
+
+    Every row's cell is read, so a numeric comparison validates every
+    cell of its column even when sibling OR/AND branches already decide
+    the row — a non-numeric cell anywhere fails the query.
+    """
+    idx = col_index[comp.column]
+    vec = _column_vector(rows, idx)
+    if comp.quoted:
+        target_text = comp.value_text
+        return [_compare(field, comp.op, target_text) for field in vec]
+    target = Decimal(comp.value_text)
+    return [
+        _compare(_decimal(field, comp.column), comp.op, target) for field in vec
+    ]
+
+
+def _evaluate_node(
+    rows: List[Sequence[str]],
+    col_index: Dict[str, int],
+    node: Condition,
+) -> List[bool]:
+    if isinstance(node, Comparison):
+        return _comparison_mask(rows, col_index, node)
+    masks = [_evaluate_node(rows, col_index, term) for term in node.terms]
+    if isinstance(node, And):
+        return [all(flags) for flags in zip(*masks)]
+    # Or
+    return [any(flags) for flags in zip(*masks)]
+
+
 def _evaluate_predicate(
     rows: List[Sequence[str]],
     col_index: Dict[str, int],
-    where: Sequence[Comparison],
+    where: Optional[Condition],
 ) -> List[bool]:
-    """Vectorized conjunction; runs on raw columns, ahead of projection."""
-    mask = [True] * len(rows)
-    for comp in where:
-        idx = col_index[comp.column]
-        vec = _column_vector(rows, idx)
-        if comp.quoted:
-            target_text = comp.value_text
-            for i, field in enumerate(vec):
-                if mask[i]:
-                    mask[i] = _compare(field, comp.op, target_text)
-        else:
-            target = Decimal(comp.value_text)
-            for i, field in enumerate(vec):
-                if mask[i]:
-                    mask[i] = _compare(_decimal(field, comp.column), comp.op, target)
-    return mask
+    """Vectorized boolean condition; runs on raw columns, ahead of projection."""
+    if where is None:
+        return [True] * len(rows)
+    return _evaluate_node(rows, col_index, where)
 
 
 def _project_value(field: str) -> Any:
