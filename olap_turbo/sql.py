@@ -3,30 +3,40 @@
 Supported grammar (the complete surface for this baseline)::
 
     query      := SELECT select_list FROM identifier
-                  [ WHERE conjunction ] [ GROUP BY identifier (, identifier)* ]
+                  [ WHERE boolean ] [ GROUP BY identifier (, identifier)* ]
     select_list:= grouping_column (, grouping_column)*,
                   count_star, sum_expr (, sum_expr)*   (grouped aggregate query)
                 | count_star [, sum_expr ]*            (aggregate query)
                 | column (, column)*                   (projection query)
-    conjunction:= comparison (AND comparison)*
+    boolean    := or_expr
+    or_expr    := and_expr (OR and_expr)*
+    and_expr   := factor (AND factor)*
+    factor     := LPAREN or_expr RPAREN | comparison
     comparison := identifier op value
     op         := = | != | > | >= | < | <=
     value      := number-literal | double-quoted-string-literal
+
+AND binds tighter than OR; parentheses may be nested to override the
+precedence. Parentheses *combine* boolean conditions only: a parenthesized
+group must itself contain an AND/OR combination (``(a = 1)`` is rejected),
+and parentheses may never wrap columns, values or comparisons-as-values.
+There is no NOT, no constant truth value and no other expression forms.
 
 A grouped query names one or more distinct grouping columns (at least two
 for the multi-column shape): they must head the SELECT list in the same
 order as the GROUP BY list, followed by count(*) and one or more distinct
 sum(column) expressions.
 
-Anything else (missing FROM, OR, functions other than count(*)/sum(),
-wildcards, extra clauses, malformed syntax) raises :class:`ValueError`.
+Anything else (missing FROM, NOT, functions other than count(*)/sum() in
+SELECT, wildcards, extra clauses, malformed syntax, unmatched parentheses,
+OR outside WHERE) raises :class:`ValueError`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 
 class _TokKind(Enum):
@@ -42,7 +52,7 @@ class _TokKind(Enum):
     EOF = "eof"
 
 
-_KEYWORDS = {"SELECT", "FROM", "WHERE", "AND", "GROUP", "BY"}
+_KEYWORDS = {"SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "GROUP", "BY"}
 
 
 @dataclass
@@ -145,6 +155,21 @@ class Comparison:
 
 
 @dataclass(frozen=True)
+class BoolOp:
+    """A conjunction or disjunction of boolean conditions.
+
+    ``op`` is ``"AND"`` or ``"OR"``; operands are :class:`Comparison`
+    leaves or further :class:`BoolOp` nodes.
+    """
+
+    op: str
+    operands: Tuple["WhereExpr", ...]
+
+
+WhereExpr = Union[Comparison, BoolOp]
+
+
+@dataclass(frozen=True)
 class SelectItem:
     # Original expression text as written in the query, e.g. "count(*)", "sum(a)".
     text: str
@@ -156,7 +181,7 @@ class SelectItem:
 class Query:
     select: Tuple[SelectItem, ...]
     table: str
-    where: Tuple[Comparison, ...]
+    where: Optional[WhereExpr] = None
     group_by: Tuple[str, ...] = ()
 
     @property
@@ -179,11 +204,21 @@ class Query:
             elif item.kind == "sum" and item.column not in seen:
                 seen.add(item.column)
                 cols.append(item.column)
-        for comp in self.where:
-            if comp.column not in seen:
-                seen.add(comp.column)
-                cols.append(comp.column)
+        if self.where is not None:
+            self._collect_where_columns(self.where, cols, seen)
         return tuple(cols)
+
+    @staticmethod
+    def _collect_where_columns(
+        node: WhereExpr, cols: List[str], seen: set
+    ) -> None:
+        if isinstance(node, Comparison):
+            if node.column not in seen:
+                seen.add(node.column)
+                cols.append(node.column)
+            return
+        for operand in node.operands:
+            Query._collect_where_columns(operand, cols, seen)
 
 
 _OPS = {"=", "!=", ">", ">=", "<", "<="}
@@ -207,6 +242,13 @@ class _Parser:
         if tok.kind is not _TokKind.KEYWORD or tok.text != word:
             raise ValueError(f"expected {word} but found {tok.text!r}")
 
+    def _accept_keyword(self, word: str) -> bool:
+        tok = self._peek()
+        if tok.kind is _TokKind.KEYWORD and tok.text == word:
+            self._next()
+            return True
+        return False
+
     def parse(self) -> Query:
         self._expect_keyword("SELECT")
         items = self._parse_select_list()
@@ -214,12 +256,12 @@ class _Parser:
         table_tok = self._next()
         if table_tok.kind is not _TokKind.IDENT:
             raise ValueError("table name must be a simple identifier")
-        where: List[Comparison] = []
+        where: Optional[WhereExpr] = None
         group_by: List[str] = []
         tok = self._peek()
         if tok.kind is _TokKind.KEYWORD and tok.text == "WHERE":
             self._next()
-            where = self._parse_where()
+            where = self._parse_or()
             tok = self._peek()
         if tok.kind is _TokKind.KEYWORD and tok.text == "GROUP":
             self._next()
@@ -233,10 +275,10 @@ class _Parser:
         else:
             self._validate_ungrouped(items)
         if tok.kind is not _TokKind.EOF:
-            # Trailing tokens: unsupported clause (ORDER BY, HAVING, OR ...)
-            # or plain malformed input.
+            # Trailing tokens: unsupported clause (ORDER BY, HAVING, ...),
+            # an unmatched ')' or plain malformed input.
             raise ValueError(f"unsupported or unexpected token {tok.text!r}")
-        return Query(tuple(items), table_tok.text, tuple(where), tuple(group_by))
+        return Query(tuple(items), table_tok.text, where, tuple(group_by))
 
     def _validate_grouped(
         self, items: List[SelectItem], group_by: List[str]
@@ -336,12 +378,43 @@ class _Parser:
             raise ValueError(f"expected {kind.value} but found {tok.text!r}")
         return tok
 
-    def _parse_where(self) -> List[Comparison]:
-        comps = [self._parse_comparison()]
-        while self._peek().kind is _TokKind.KEYWORD and self._peek().text == "AND":
+    # ----- WHERE boolean grammar: or_expr := and_expr (OR and_expr)* -----
+
+    def _parse_or(self) -> WhereExpr:
+        operands = [self._parse_and()]
+        while self._accept_keyword("OR"):
+            operands.append(self._parse_and())
+        if len(operands) == 1:
+            return operands[0]
+        return BoolOp("OR", tuple(operands))
+
+    def _parse_and(self) -> WhereExpr:
+        operands = [self._parse_factor()]
+        while self._accept_keyword("AND"):
+            operands.append(self._parse_factor())
+        if len(operands) == 1:
+            return operands[0]
+        return BoolOp("AND", tuple(operands))
+
+    def _parse_factor(self) -> WhereExpr:
+        tok = self._peek()
+        if tok.kind is _TokKind.LPAREN:
             self._next()
-            comps.append(self._parse_comparison())
-        return comps
+            node = self._parse_or()
+            self._expect(_TokKind.RPAREN)
+            if isinstance(node, Comparison):
+                # Parentheses only *combine* boolean conditions; they may
+                # not wrap a single comparison, a column or a value.
+                raise ValueError(
+                    "parentheses may only group combined AND/OR conditions, "
+                    "not a single comparison"
+                )
+            return node
+        if tok.kind is _TokKind.IDENT:
+            return self._parse_comparison()
+        # NOT, dangling AND/OR, ')', EOF, numbers, ...: none can start a
+        # boolean condition.
+        raise ValueError(f"expected a boolean condition but found {tok.text!r}")
 
     def _parse_comparison(self) -> Comparison:
         col = self._expect(_TokKind.IDENT)

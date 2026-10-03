@@ -3,10 +3,16 @@
 The scanner reads each CSV table in record batches of at most
 :data:`BATCH_SIZE` rows, materializing only the columns referenced by the
 SELECT list, the GROUP BY key or the WHERE clause (column pruning).
-Within a batch the predicate is evaluated column-at-a-time *before*
+Within a batch the predicate — an AND/OR/parentheses boolean tree of
+column-op-value comparisons — is evaluated column-at-a-time *before*
 projection or grouping (predicate pushdown), and aggregates — either a
 single global row or per-group hash tables keyed by one GROUP BY column
 or a tuple of several GROUP BY columns — roll forward batch by batch.
+
+Every cell read by a numeric comparison is parsed eagerly for every row
+of a batch, even on rows whose other OR branches already settle the
+outcome: OR never short-circuits cell validation, so a non-numeric cell
+anywhere a numeric predicate reaches fails the whole query.
 
 All arithmetic and numeric comparison go through :class:`decimal.Decimal`
 so results are deterministic and free of binary-float artifacts.
@@ -19,7 +25,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
-from .sql import Comparison, Query, SelectItem, parse_sql
+from .sql import Comparison, Query, SelectItem, WhereExpr, parse_sql
 
 BATCH_SIZE = 1024
 
@@ -60,27 +66,65 @@ def _column_vector(rows: Sequence[Sequence[str]], idx: int) -> List[str]:
     return vec
 
 
+def _comparison_vector(
+    rows: Sequence[Sequence[str]],
+    col_index: Dict[str, int],
+    comp: Comparison,
+) -> List[bool]:
+    """Evaluate one comparison over every row of the batch.
+
+    The column is parsed for *every* row up front, including rows whose
+    other OR branches already decide the row: OR does not short-circuit
+    cell validation.
+    """
+    idx = col_index[comp.column]
+    vec = _column_vector(rows, idx)
+    result: List[bool] = [False] * len(vec)
+    if comp.quoted:
+        target_text = comp.value_text
+        for i, field in enumerate(vec):
+            result[i] = _compare(field, comp.op, target_text)
+    else:
+        target = Decimal(comp.value_text)
+        for i, field in enumerate(vec):
+            result[i] = _compare(_decimal(field, comp.column), comp.op, target)
+    return result
+
+
+def _combine(op: str, vectors: Sequence[Sequence[bool]]) -> List[bool]:
+    """Combine per-row boolean vectors with AND or OR."""
+    if op == "AND":
+        mask = [True] * len(vectors[0])
+        for vec in vectors:
+            for i, value in enumerate(vec):
+                mask[i] = mask[i] and value
+        return mask
+    mask = [False] * len(vectors[0])
+    for vec in vectors:
+        for i, value in enumerate(vec):
+            mask[i] = mask[i] or value
+    return mask
+
+
+def _eval_node(
+    node: WhereExpr,
+    rows: Sequence[Sequence[str]],
+    col_index: Dict[str, int],
+) -> List[bool]:
+    """Vectorized boolean-tree evaluation on raw columns."""
+    if isinstance(node, Comparison):
+        return _comparison_vector(rows, col_index, node)
+    vectors = [_eval_node(operand, rows, col_index) for operand in node.operands]
+    return _combine(node.op, vectors)
+
+
 def _evaluate_predicate(
     rows: List[Sequence[str]],
     col_index: Dict[str, int],
-    where: Sequence[Comparison],
+    where: WhereExpr,
 ) -> List[bool]:
-    """Vectorized conjunction; runs on raw columns, ahead of projection."""
-    mask = [True] * len(rows)
-    for comp in where:
-        idx = col_index[comp.column]
-        vec = _column_vector(rows, idx)
-        if comp.quoted:
-            target_text = comp.value_text
-            for i, field in enumerate(vec):
-                if mask[i]:
-                    mask[i] = _compare(field, comp.op, target_text)
-        else:
-            target = Decimal(comp.value_text)
-            for i, field in enumerate(vec):
-                if mask[i]:
-                    mask[i] = _compare(_decimal(field, comp.column), comp.op, target)
-    return mask
+    """Vectorized predicate tree; runs on raw columns, ahead of projection."""
+    return _eval_node(where, rows, col_index)
 
 
 def _project_value(field: str) -> Any:
@@ -194,7 +238,11 @@ def _run_batches(
             batch = [row for _, row in zip(range(BATCH_SIZE), reader)]
             if not batch:
                 break
-            mask = _evaluate_predicate(batch, col_index, query.where)
+            mask = (
+                [True] * len(batch)
+                if query.where is None
+                else _evaluate_predicate(batch, col_index, query.where)
+            )
             for i, matched in enumerate(mask):
                 if not matched:
                     continue
@@ -219,7 +267,11 @@ def _run_batches(
         batch = [row for _, row in zip(range(BATCH_SIZE), reader)]
         if not batch:
             break
-        mask = _evaluate_predicate(batch, col_index, query.where)
+        mask = (
+            [True] * len(batch)
+            if query.where is None
+            else _evaluate_predicate(batch, col_index, query.where)
+        )
 
         if query.is_aggregate:
             for i, matched in enumerate(mask):

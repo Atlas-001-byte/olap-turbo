@@ -523,8 +523,6 @@ def test_three_column_grouping(tmp_path):
         # whose SELECT list omits a grouping column is rejected too.
         "SELECT a, count(*), sum(b) FROM t GROUP BY",
         "SELECT a, count(*), sum(c) FROM t GROUP BY a, b",
-        # non-AND conditions remain rejected in grouped queries
-        "SELECT a, count(*), sum(b) FROM t WHERE x = 1 OR y = 2 GROUP BY a",
     ],
 )
 def test_bad_grouped_sql_raises_valueerror(tmp_path, sql):
@@ -566,6 +564,262 @@ def test_batches_larger_than_batch_size(tmp_path):
     assert agg["rows"] == [[10, 45]]
 
 
+# ---------- boolean WHERE (AND / OR / parentheses) ----------
+
+def test_or_basic_projection(data_dir):
+    result = execute(str(data_dir), "SELECT id FROM sales WHERE id = 1 OR id = 3")
+    assert result["rows"] == [[1], [3]]
+    assert result["row_count"] == 2
+
+
+def test_and_binds_tighter_than_or(data_dir):
+    # a = 1 OR (b = 2 AND c = 3): rows 1 and 2
+    result = execute(
+        str(data_dir),
+        'SELECT id FROM sales WHERE id = 1 OR id = 2 AND region = "west"',
+    )
+    assert result["rows"] == [[1], [2]]
+
+
+def test_parentheses_override_precedence(data_dir):
+    # (id = 1 OR id = 2) AND region = "east": only row 1
+    result = execute(
+        str(data_dir),
+        'SELECT id FROM sales WHERE (id = 1 OR id = 2) AND region = "east"',
+    )
+    assert result["rows"] == [[1]]
+
+
+def test_nested_and_redundant_parentheses(data_dir):
+    result = execute(
+        str(data_dir),
+        'SELECT id FROM sales WHERE ((id = 1 OR id = 2) AND '
+        '(region = "east" OR region = "west"))',
+    )
+    assert result["rows"] == [[1], [2]]
+    result = execute(
+        str(data_dir),
+        'SELECT id FROM sales WHERE (((id = 1 OR id = 3)))',
+    )
+    assert result["rows"] == [[1], [3]]
+
+
+def test_or_mixed_types_no_cross_coercion(data_dir):
+    # One numeric branch and one text branch; matches rows 4 (id = 4)
+    # and 5 (note = "y").
+    result = execute(
+        str(data_dir),
+        'SELECT id FROM sales WHERE id = 4 OR note = "y"',
+    )
+    assert result["rows"] == [[4], [5]]
+
+
+def test_or_with_global_aggregate(data_dir):
+    result = execute(
+        str(data_dir),
+        "SELECT count(*), sum(id) FROM sales WHERE id = 4 OR region = \"west\"",
+    )
+    assert result["rows"] == [[3, 11]]  # rows 2, 4, 5
+
+
+def test_or_aggregate_excluded_bad_sum_cell(data_dir):
+    result = execute(
+        str(data_dir),
+        "SELECT count(*), sum(amount) FROM sales WHERE id = 2 OR id = 5",
+    )
+    assert result["rows"] == [[2, 18.25]]
+
+
+def test_or_with_single_column_grouping(data_dir):
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(id) FROM sales "
+        "WHERE id = 1 OR id = 5 GROUP BY region",
+    )
+    assert result["columns"] == ["region", "count(*)", "sum(id)"]
+    assert result["rows"] == [["east", 1, 1], ["west", 1, 5]]
+    assert result["row_count"] == 2
+
+
+def test_or_with_multi_column_grouping(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "r,p,v\n"
+        "x,a,1\n"
+        "y,b,2\n"
+        "x,a,3\n"
+        "x,b,4\n"
+        "y,a,5\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT r, p, count(*), sum(v) FROM t "
+        'WHERE (r = "x" AND p = "a") OR v >= 5 GROUP BY r, p',
+    )
+    # (x,a): rows v=1,3 -> count 2, sum 4 ; (y,a): row v=5
+    assert result["rows"] == [
+        ["x", "a", 2, 4],
+        ["y", "a", 1, 5],
+    ]
+    assert result["row_count"] == 2
+
+
+def test_or_empty_result_shape_unchanged(data_dir):
+    agg = execute(
+        str(data_dir), "SELECT count(*), sum(id) FROM sales WHERE id < 0 OR id > 99"
+    )
+    assert agg == {"columns": ["count(*)", "sum(id)"], "rows": [[0, 0]], "row_count": 1}
+    grouped = execute(
+        str(data_dir),
+        'SELECT region, count(*), sum(id) FROM sales WHERE id < 0 OR id > 99 '
+        "GROUP BY region",
+    )
+    assert grouped == {
+        "columns": ["region", "count(*)", "sum(id)"],
+        "rows": [],
+        "row_count": 0,
+    }
+
+
+def test_or_numeric_cells_validated_eagerly_even_when_other_branch_true(data_dir):
+    # Row 4 matches the id = 4 branch, but its amount is "abc": the
+    # numeric OR branch must still be read for every row.
+    with pytest.raises(ValueError):
+        execute(
+            str(data_dir),
+            "SELECT id FROM sales WHERE id = 4 OR amount >= 0",
+        )
+    # Same obligation regardless of branch order or a text branch.
+    with pytest.raises(ValueError):
+        execute(
+            str(data_dir),
+            "SELECT id FROM sales WHERE amount >= 0 OR id = 4",
+        )
+    with pytest.raises(ValueError):
+        execute(
+            str(data_dir),
+            'SELECT id FROM sales WHERE note = "z" OR amount >= 0',
+        )
+    # A numeric comparison under an AND inside parentheses is eager too:
+    # row 1 passes the parenthesized group, other rows still get parsed.
+    with pytest.raises(ValueError):
+        execute(
+            str(data_dir),
+            "SELECT id FROM sales WHERE id = 4 OR (id >= 0 AND amount >= 0)",
+        )
+
+
+def test_or_unknown_column_in_any_branch_raises_keyerror(data_dir):
+    with pytest.raises(KeyError):
+        execute(
+            str(data_dir),
+            "SELECT id FROM sales WHERE missing = 1 OR id = 1",
+        )
+    with pytest.raises(KeyError):
+        execute(
+            str(data_dir),
+            "SELECT id FROM sales WHERE id = 1 OR (missing = 1 AND id = 2)",
+        )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a FROM t WHERE (a = 1",            # unmatched '('
+        "SELECT a FROM t WHERE a = 1)",            # unmatched ')'
+        "SELECT a FROM t WHERE ()",                # empty group
+        "SELECT a FROM t WHERE (a)",               # parens around a column
+        "SELECT a FROM t WHERE a = (1)",           # parens around a value
+        "SELECT a FROM t WHERE (1)",               # parens around a number
+        "SELECT a FROM t WHERE (a = 1)",           # parens around one comparison
+        "SELECT a FROM t WHERE ((a = 1))",         # nested parens around one
+        "SELECT a FROM t WHERE (a = 1) OR b = 2",  # grouped single comparison
+        "SELECT a FROM t WHERE (a = 1",            # missing close after valid group
+        "SELECT a FROM t WHERE a = 1 OR",          # dangling OR
+        "SELECT a FROM t WHERE OR a = 1",          # leading OR
+        "SELECT a FROM t WHERE a = 1 AND",         # dangling AND
+        "SELECT a FROM t WHERE AND a = 1",         # leading AND
+        "SELECT a FROM t WHERE a = 1 AND OR a = 2",  # consecutive connectives
+        "SELECT a FROM t WHERE a = 1 a = 2",       # missing connective
+        "SELECT a FROM t WHERE NOT a = 1",         # NOT is unsupported
+        "SELECT a FROM t WHERE a >= >= 1",         # consecutive operators
+        "SELECT a FROM t WHERE a = 1 OR b = 2 OR", # trailing OR
+        "SELECT a FROM t WHERE (a = 1 OR b = 2",   # unbalanced nested
+        "SELECT a FROM t WHERE a = 1 OR ()",       # empty group on right
+        "SELECT a, count(*) FROM t WHERE a = 1 OR b = 2",  # mixed SELECT shape
+    ],
+)
+def test_bad_boolean_where_raises_valueerror(tmp_path, sql):
+    (tmp_path / "t.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        execute(str(tmp_path), sql)
+
+
+def test_boolean_predicate_across_batch_sizes(tmp_path, monkeypatch):
+    import olap_turbo.engine as engine_mod
+
+    n = BATCH_SIZE * 2 + 7
+    (tmp_path / "big.csv").write_text(
+        "k,v\n" + "".join(f"{'ab'[i % 2]},{i}\n" for i in range(n)),
+        encoding="utf-8",
+    )
+    pred = "WHERE (v >= 10 AND v < 20) OR v >= 100"
+    projection_sql = f"SELECT k, v FROM big {pred}"
+    aggregate_sql = f"SELECT count(*), sum(v) FROM big {pred}"
+    grouped_sql = f"SELECT k, count(*), sum(v) FROM big {pred} GROUP BY k"
+
+    expected = {
+        "proj": execute(str(tmp_path), projection_sql),
+        "agg": execute(str(tmp_path), aggregate_sql),
+        "grp": execute(str(tmp_path), grouped_sql),
+    }
+    expected_matches = [i for i in range(n) if (10 <= i < 20) or i >= 100]
+    assert [r[1] for r in expected["proj"]["rows"]] == expected_matches
+    assert expected["agg"]["rows"] == [
+        [len(expected_matches), sum(expected_matches)]
+    ]
+    for size in (1, 3, 7, BATCH_SIZE + 1):
+        monkeypatch.setattr(engine_mod, "BATCH_SIZE", size)
+        assert execute(str(tmp_path), projection_sql) == expected["proj"]
+        assert execute(str(tmp_path), aggregate_sql) == expected["agg"]
+        assert execute(str(tmp_path), grouped_sql) == expected["grp"]
+
+
+def test_parse_sql_boolean_tree_shape():
+    from olap_turbo.sql import BoolOp, Comparison
+
+    q = parse_sql("SELECT a FROM t WHERE a = 1 OR b = 2 AND c = 3")
+    assert isinstance(q.where, BoolOp)
+    assert q.where.op == "OR"
+    assert len(q.where.operands) == 2
+    assert isinstance(q.where.operands[0], Comparison)
+    right = q.where.operands[1]
+    assert isinstance(right, BoolOp) and right.op == "AND"
+    assert [c.column for c in right.operands] == ["b", "c"]
+    # Parentheses do not add wrapper nodes around a single grouped expr.
+    q2 = parse_sql("SELECT a FROM t WHERE (a = 1 OR b = 2) AND c = 3")
+    assert q2.where.op == "AND"
+    assert isinstance(q2.where.operands[0], BoolOp)
+    assert q2.where.operands[0].op == "OR"
+    # No WHERE stays None.
+    assert parse_sql("SELECT a FROM t").where is None
+    # Predicate columns are all required, in first-appearance order.
+    assert q2.required_columns() == ("a", "b", "c")
+
+
+def test_or_with_unreferenced_garbage_column(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "a,b,noise\n"
+        "1,x,not-a-number!!!\n"
+        "2,y,####\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path), 'SELECT a FROM t WHERE b = "x" OR b = "y"'
+    )
+    assert result["rows"] == [[1], [2]]
+
+
 # ---------- error contract ----------
 
 def test_missing_table_raises_filenotfound(data_dir):
@@ -590,8 +844,7 @@ def test_unknown_column_raises_keyerror(data_dir):
         "SELECT a FROM sales WHERE",           # incomplete WHERE
         "SELECT a FROM sales WHERE region =",  # missing value
         "SELECT * FROM sales",                 # wildcard
-        "SELECT a FROM sales OR a = 1",        # stray OR
-        "SELECT a FROM sales WHERE a = 1 OR b = 2",
+        "SELECT a FROM sales OR a = 1",        # stray OR outside WHERE
         "SELECT avg(a) FROM sales",            # unsupported function
         "SELECT count(a) FROM sales",
         "SELECT a, count(*) FROM sales",       # mixed
