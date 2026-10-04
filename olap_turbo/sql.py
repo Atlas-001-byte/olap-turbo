@@ -6,10 +6,11 @@ Supported grammar (the complete surface for this baseline)::
                   [ WHERE boolean ] [ GROUP BY identifier (, identifier)* ]
                   [ HAVING having_boolean ]
                   [ ORDER BY sort_item (, sort_item)* ] [ LIMIT integer ]
-    sort_item  := (identifier | count_star | sum_expr) [ ASC | DESC ]
+    sort_item  := (identifier | count_star | agg_expr) [ ASC | DESC ]
+    agg_expr   := sum_expr | avg_expr | min_expr | max_expr
     select_list:= grouping_column (, grouping_column)*,
-                  count_star, sum_expr (, sum_expr)*   (grouped aggregate query)
-                | count_star [, sum_expr ]*            (aggregate query)
+                  count_star, agg_expr (, agg_expr)*   (grouped aggregate query)
+                | count_star [, agg_expr ]*            (aggregate query)
                 | column (, column)*                   (projection query)
     boolean    := or_expr
     or_expr    := and_expr (OR and_expr)*
@@ -25,11 +26,12 @@ aggregate-to-number comparisons::
     having_boolean := having_or
     having_factor  := LPAREN having_or RPAREN | having_comparison
     having_comparison := aggregate op number-literal
-    aggregate      := count_star | sum_expr
+    aggregate      := count_star | agg_expr
 
-The left side must be a ``count(*)`` or ``sum(column)`` expression that
-already appears in the SELECT list; the right side is an unquoted finite
-decimal literal only (no strings, no columns, no other expressions).
+The left side must be a ``count(*)``, ``sum(column)``, ``avg(column)``,
+``min(column)`` or ``max(column)`` expression that already appears in the
+SELECT list; the right side is an unquoted finite decimal literal only (no
+strings, no columns, no other expressions).
 
 AND binds tighter than OR; parentheses may be nested to override the
 precedence. Parentheses *combine* boolean conditions only: a parenthesized
@@ -43,20 +45,24 @@ an ungrouped aggregate query); it is rejected on plain projection queries.
 ORDER BY follows HAVING (or WHERE/GROUP BY when HAVING is absent) and LIMIT
 follows ORDER BY; each may appear at most once and never out of order. Each
 sort item references a result column already in the SELECT list — a plain or
-grouping column, ``count(*)`` or ``sum(column)`` — with an optional ``ASC``
-(default) or ``DESC`` direction; duplicate sort items and references to
-expressions absent from the SELECT list are rejected. LIMIT takes a single
-non-negative decimal integer literal (digits only: no sign, no fraction, no
-strings, columns or expressions).
+grouping column, ``count(*)`` or one of ``sum(column)``, ``avg(column)``,
+``min(column)``, ``max(column)`` — with an optional ``ASC`` (default) or
+``DESC`` direction; duplicate sort items and references to expressions
+absent from the SELECT list are rejected. LIMIT takes a single non-negative
+decimal integer literal (digits only: no sign, no fraction, no strings,
+columns or expressions).
 
 A grouped query names one or more distinct grouping columns (at least two
 for the multi-column shape): they must head the SELECT list in the same
 order as the GROUP BY list, followed by count(*) and one or more distinct
-sum(column) expressions.
+aggregate expressions (``sum``/``avg``/``min``/``max`` over a column).
+Every aggregate expression — the function name plus its column — may appear
+at most once in a SELECT list, in grouped and ungrouped queries alike.
 
-Anything else (missing FROM, NOT, functions other than count(*)/sum() in
-SELECT, wildcards, extra clauses, malformed syntax, unmatched parentheses,
-OR outside WHERE/HAVING) raises :class:`ValueError`.
+Anything else (missing FROM, NOT, functions other than
+count(*)/sum()/avg()/min()/max() in SELECT, wildcards, extra clauses,
+malformed syntax, unmatched parentheses, OR outside WHERE/HAVING) raises
+:class:`ValueError`.
 """
 
 from __future__ import annotations
@@ -204,8 +210,9 @@ WhereExpr = Union[Comparison, BoolOp]
 class HavingComparison:
     """One HAVING leaf: aggregate op finite-decimal-literal.
 
-    ``kind`` is ``"count_star"`` or ``"sum"`` (with ``column`` naming the
-    summed column); ``text`` is the aggregate's SELECT expression text.
+    ``kind`` is ``"count_star"`` or one of ``"sum"``, ``"avg"``, ``"min"``,
+    ``"max"`` (with ``column`` naming the aggregated column); ``text`` is
+    the aggregate's SELECT expression text.
     """
 
     text: str
@@ -222,9 +229,10 @@ BooleanNode = Union[Comparison, HavingComparison, BoolOp]
 
 @dataclass(frozen=True)
 class SelectItem:
-    # Original expression text as written in the query, e.g. "count(*)", "sum(a)".
+    # Original expression text as written in the query, e.g. "count(*)",
+    # "sum(a)", "avg(a)".
     text: str
-    kind: str  # "column" | "count_star" | "sum"
+    kind: str  # "column" | "count_star" | "sum" | "avg" | "min" | "max"
     column: Optional[str] = None
 
 
@@ -233,11 +241,11 @@ class SortItem:
     """One ORDER BY item: a result-column reference with a direction.
 
     ``text`` is the normalized expression text (``a``, ``count(*)``,
-    ``sum(a)``); ``kind``/``column`` mirror :class:`SelectItem`.
+    ``sum(a)``, ``avg(a)``); ``kind``/``column`` mirror :class:`SelectItem`.
     """
 
     text: str
-    kind: str  # "column" | "count_star" | "sum"
+    kind: str  # "column" | "count_star" | "sum" | "avg" | "min" | "max"
     column: Optional[str] = None
     descending: bool = False
 
@@ -261,7 +269,7 @@ class Query:
         return bool(self.group_by)
 
     def required_columns(self) -> Tuple[str, ...]:
-        """Columns the scan must materialize (group key, sums, predicates)."""
+        """Columns the scan must materialize (group key, aggregates, predicates)."""
         cols: List[str] = []
         seen = set()
         for item in self.select:
@@ -269,7 +277,7 @@ class Query:
                 if item.column not in seen:
                     seen.add(item.column)
                     cols.append(item.column)
-            elif item.kind == "sum" and item.column not in seen:
+            elif item.kind in _AGG_KINDS and item.column not in seen:
                 seen.add(item.column)
                 cols.append(item.column)
         if self.where is not None:
@@ -290,6 +298,9 @@ class Query:
 
 
 _OPS = {"=", "!=", ">", ">=", "<", "<="}
+
+# Column aggregates over finite decimals, besides count(*).
+_AGG_KINDS = ("sum", "avg", "min", "max")
 
 
 class _Parser:
@@ -393,14 +404,15 @@ class _Parser:
         """Enforce the grouped shape.
 
         SELECT leads with the GROUP BY columns in the same order (distinct),
-        followed by count(*) and one or more distinct sum(column) items.
+        followed by count(*) and one or more distinct aggregate expressions
+        (sum/avg/min/max over a non-grouping column).
         """
         if len(group_by) != len(set(group_by)):
             raise ValueError("GROUP BY may not list the same column twice")
         if len(items) < len(group_by) + 2:
             raise ValueError(
                 "grouped SELECT must list the grouping columns followed by "
-                "count(*) and one or more sum(column)"
+                "count(*) and one or more aggregate expressions"
             )
         for pos, group_col in enumerate(group_by):
             item = items[pos]
@@ -413,20 +425,21 @@ class _Parser:
             raise ValueError(
                 "grouped SELECT must list count(*) after the grouping columns"
             )
-        seen_sums = set()
+        seen_aggs = set()
         for item in items[len(group_by) + 1 :]:
-            if item.kind != "sum":
+            if item.kind not in _AGG_KINDS:
                 raise ValueError(
                     "grouped SELECT may only contain the grouping columns, "
-                    "count(*) and sum(column)"
+                    "count(*) and sum/avg/min/max aggregates"
                 )
-            if item.column in seen_sums:
-                raise ValueError(f"duplicate aggregate sum({item.column})")
+            key = (item.kind, item.column)
+            if key in seen_aggs:
+                raise ValueError(f"duplicate aggregate {item.text}")
             if item.column in group_by:
                 raise ValueError(
-                    f"GROUP BY column {item.column} may not be summed"
+                    f"GROUP BY column {item.column} may not be aggregated"
                 )
-            seen_sums.add(item.column)
+            seen_aggs.add(key)
 
     def _parse_select_list(self) -> List[SelectItem]:
         items = [self._parse_select_item()]
@@ -437,22 +450,30 @@ class _Parser:
 
     def _validate_ungrouped(self, items: List[SelectItem]) -> None:
         """Rules for queries without GROUP BY (the baseline shapes)."""
-        if items[0].kind == "sum":
-            raise ValueError("sum(column) requires count(*) in the SELECT list")
+        if items[0].kind in _AGG_KINDS:
+            raise ValueError(
+                f"{items[0].kind}(column) requires count(*) in the SELECT list"
+            )
         aggregate = items[0].kind == "count_star"
+        seen_aggs = set()
         for item in items[1:]:
             if aggregate:
-                if item.kind != "sum":
+                if item.kind not in _AGG_KINDS:
                     raise ValueError(
-                        "aggregate SELECT may only contain count(*) and sum(column)"
+                        "aggregate SELECT may only contain count(*) and "
+                        "sum/avg/min/max aggregates"
                     )
-            elif item.kind == "sum":
+                key = (item.kind, item.column)
+                if key in seen_aggs:
+                    raise ValueError(f"duplicate aggregate {item.text}")
+                seen_aggs.add(key)
+            elif item.kind in _AGG_KINDS:
                 raise ValueError(
-                    "sum(column) requires count(*) in the SELECT list"
+                    f"{item.kind}(column) requires count(*) in the SELECT list"
                 )
             elif item.kind != "column":
                 raise ValueError(
-                    "count(*)/sum() cannot be mixed with plain columns"
+                    "count(*)/aggregates cannot be mixed with plain columns"
                 )
 
     def _parse_select_item(self) -> SelectItem:
@@ -466,9 +487,10 @@ class _Parser:
             upper = name_tok.text.upper()
             if upper == "COUNT" and inner.kind is _TokKind.STAR:
                 return SelectItem("count(*)", "count_star")
-            if upper == "SUM" and inner.kind is _TokKind.IDENT:
-                return SelectItem(f"sum({inner.text})", "sum", inner.text)
-            # Any other function (count(col), avg, max, ...) is unsupported.
+            if upper in ("SUM", "AVG", "MIN", "MAX") and inner.kind is _TokKind.IDENT:
+                kind = upper.lower()
+                return SelectItem(f"{kind}({inner.text})", kind, inner.text)
+            # Any other function (count(col), median, ...) is unsupported.
             raise ValueError(
                 f"unsupported SELECT expression {name_tok.text}({inner.text})"
             )
@@ -577,8 +599,9 @@ class _Parser:
         # Plain columns/grouping columns, NOT, numbers, dangling AND/OR,
         # ')', EOF, ...: none can start a HAVING aggregate comparison.
         raise ValueError(
-            "HAVING condition must compare count(*) or sum(column) with a "
-            f"number, but found {tok.text!r}"
+            "HAVING condition must compare count(*) or a "
+            "sum/avg/min/max aggregate with a number, but found "
+            f"{tok.text!r}"
         )
 
     def _parse_having_comparison(self) -> HavingComparison:
@@ -589,11 +612,13 @@ class _Parser:
         upper = name_tok.text.upper()
         if upper == "COUNT" and inner.kind is _TokKind.STAR:
             text, kind, column = "count(*)", "count_star", None
-        elif upper == "SUM" and inner.kind is _TokKind.IDENT:
-            text, kind, column = f"sum({inner.text})", "sum", inner.text
+        elif upper in ("SUM", "AVG", "MIN", "MAX") and inner.kind is _TokKind.IDENT:
+            kind = upper.lower()
+            text, column = f"{kind}({inner.text})", inner.text
         else:
             raise ValueError(
-                "HAVING may only compare count(*) or sum(column) aggregates"
+                "HAVING may only compare count(*) or sum/avg/min/max "
+                "aggregates"
             )
         op_tok = self._expect(_TokKind.OP)
         if op_tok.text not in _OPS:
@@ -616,13 +641,7 @@ class _Parser:
                 self._validate_having_aggregates(operand, items)
             return
         for item in items:
-            if node.kind == "count_star" and item.kind == "count_star":
-                return
-            if (
-                node.kind == "sum"
-                and item.kind == "sum"
-                and item.column == node.column
-            ):
+            if item.kind == node.kind and item.column == node.column:
                 return
         raise ValueError(
             f"HAVING aggregate {node.text} is not in the SELECT list"
@@ -643,12 +662,13 @@ class _Parser:
             upper = name_tok.text.upper()
             if upper == "COUNT" and inner.kind is _TokKind.STAR:
                 text, kind, column = "count(*)", "count_star", None
-            elif upper == "SUM" and inner.kind is _TokKind.IDENT:
-                text, kind, column = f"sum({inner.text})", "sum", inner.text
+            elif upper in ("SUM", "AVG", "MIN", "MAX") and inner.kind is _TokKind.IDENT:
+                kind = upper.lower()
+                text, column = f"{kind}({inner.text})", inner.text
             else:
                 raise ValueError(
                     "ORDER BY may only reference result columns, count(*) "
-                    "or sum(column)"
+                    "or sum/avg/min/max aggregates"
                 )
         elif tok.kind is _TokKind.IDENT:
             self._next()

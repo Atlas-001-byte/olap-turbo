@@ -455,9 +455,9 @@ def test_multi_grouping_across_batches(tmp_path):
         # count(*) must follow the grouping columns
         "SELECT a, b, sum(x), count(*) FROM t GROUP BY a, b",
         "SELECT count(*), a, b, sum(x) FROM t GROUP BY a, b",
-        # at least one sum, and only non-grouping sum() aggregates
+        # at least one aggregate, and only non-grouping aggregates
         "SELECT a, b, count(*) FROM t GROUP BY a, b",
-        "SELECT a, b, count(*), avg(x) FROM t GROUP BY a, b",
+        "SELECT a, b, count(*), median(x) FROM t GROUP BY a, b",
         "SELECT a, b, count(*), x, sum(y) FROM t GROUP BY a, b",
         "SELECT a, b, count(*), sum(a) FROM t GROUP BY a, b",
         "SELECT a, b, count(*), sum(b) FROM t GROUP BY a, b",
@@ -508,12 +508,13 @@ def test_three_column_grouping(tmp_path):
         "SELECT a, count(*), sum(a) FROM t GROUP BY b",
         # count(*) must follow the grouping column
         "SELECT a, sum(b), count(*) FROM t GROUP BY a",
-        # at least one sum is required
+        # at least one aggregate is required
         "SELECT a, count(*) FROM t GROUP BY a",
-        # only sum() aggregates, no duplicates
+        # only sum/avg/min/max aggregates, no duplicates
         "SELECT a, count(*), count(*) FROM t GROUP BY a",
-        "SELECT a, count(*), avg(b) FROM t GROUP BY a",
+        "SELECT a, count(*), median(b) FROM t GROUP BY a",
         "SELECT a, count(*), sum(b), sum(b) FROM t GROUP BY a",
+        "SELECT a, count(*), avg(b), avg(b) FROM t GROUP BY a",
         # aggregate shape without a leading grouping column
         "SELECT count(*), sum(a) FROM t GROUP BY a",
         # GROUP BY without a column stays rejected; a multi-column GROUP BY
@@ -1634,3 +1635,308 @@ def test_module_cli(data_dir):
     )
     payload = json.loads(proc.stdout)
     assert payload == {"columns": ["count(*)"], "rows": [[3]], "row_count": 1}
+
+
+# ---------- avg / min / max aggregates ----------
+
+def test_avg_min_max_global(data_dir):
+    result = execute(
+        str(data_dir),
+        "SELECT count(*), sum(amount), avg(amount), min(amount), max(amount) "
+        "FROM sales WHERE id != 4",
+    )
+    assert result["columns"] == [
+        "count(*)", "sum(amount)", "avg(amount)", "min(amount)", "max(amount)",
+    ]
+    # amounts 10, 20.5, 30, -2.25: sum 58.25, avg 14.5625
+    assert result["rows"] == [[
+        4, Decimal("58.25"), Decimal("14.5625"), Decimal("-2.25"), 30,
+    ]]
+    assert result["row_count"] == 1
+    assert render(result).endswith(
+        '[4,58.25,14.5625,-2.25,30]],"row_count":1}'
+    )
+
+
+def test_avg_exact_decimal_no_float_artifacts(tmp_path):
+    (tmp_path / "t.csv").write_text("v\n0.1\n0.2\n", encoding="utf-8")
+    result = execute(str(tmp_path), "SELECT count(*), avg(v) FROM t")
+    assert result["rows"] == [[2, Decimal("0.15")]]
+    assert render(result) == (
+        '{"columns":["count(*)","avg(v)"],"rows":[[2,0.15]],"row_count":1}'
+    )
+
+
+def test_avg_integral_result_stays_integer(tmp_path):
+    (tmp_path / "t.csv").write_text("v\n1\n3\n", encoding="utf-8")
+    result = execute(str(tmp_path), "SELECT count(*), avg(v), min(v), max(v) FROM t")
+    assert render(result) == (
+        '{"columns":["count(*)","avg(v)","min(v)","max(v)"],'
+        '"rows":[[2,2,1,3]],"row_count":1}'
+    )
+
+
+def test_min_max_keep_exact_decimal_text(tmp_path):
+    (tmp_path / "t.csv").write_text("v\n1.10\n1.2\n", encoding="utf-8")
+    result = execute(str(tmp_path), "SELECT count(*), min(v), max(v) FROM t")
+    assert result["rows"] == [[2, Decimal("1.10"), Decimal("1.2")]]
+    assert render(result) == (
+        '{"columns":["count(*)","min(v)","max(v)"],'
+        '"rows":[[2,1.10,1.2]],"row_count":1}'
+    )
+
+
+def test_avg_min_max_empty_global_are_null(data_dir):
+    result = execute(
+        str(data_dir),
+        "SELECT count(*), sum(id), avg(id), min(id), max(id) FROM sales "
+        "WHERE id > 100",
+    )
+    assert result["rows"] == [[0, 0, None, None, None]]
+    assert result["row_count"] == 1
+    assert render(result) == (
+        '{"columns":["count(*)","sum(id)","avg(id)","min(id)","max(id)"],'
+        '"rows":[[0,0,null,null,null]],"row_count":1}'
+    )
+
+
+def test_avg_min_max_empty_table_global(tmp_path):
+    (tmp_path / "e.csv").write_text("v\n", encoding="utf-8")
+    result = execute(str(tmp_path), "SELECT count(*), avg(v), min(v), max(v) FROM e")
+    assert result["rows"] == [[0, None, None, None]]
+    assert result["row_count"] == 1
+
+
+def test_avg_min_max_non_number_raises(data_dir):
+    # Row 4 has amount="abc": any aggregate reading it fails the query.
+    for fn in ("avg", "min", "max"):
+        with pytest.raises(ValueError):
+            execute(str(data_dir), f"SELECT count(*), {fn}(amount) FROM sales")
+        # The bad cell is never read when its row is filtered out.
+        result = execute(
+            str(data_dir),
+            f"SELECT count(*), {fn}(amount) FROM sales WHERE id != 4",
+        )
+        assert result["row_count"] == 1
+
+
+def test_avg_min_max_grouped(data_dir):
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), avg(amount), min(amount), max(amount) "
+        "FROM sales WHERE id != 4 GROUP BY region",
+    )
+    assert result["columns"] == [
+        "region", "count(*)", "avg(amount)", "min(amount)", "max(amount)",
+    ]
+    # east: 10, 30 -> avg 20; west: 20.5, -2.25 -> avg 9.125
+    assert result["rows"] == [
+        ["east", 2, 20, 10, 30],
+        ["west", 2, Decimal("9.125"), Decimal("-2.25"), Decimal("20.5")],
+    ]
+    assert result["row_count"] == 2
+
+
+def test_avg_min_max_grouped_empty(data_dir):
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), avg(id), min(id) FROM sales "
+        "WHERE id > 100 GROUP BY region",
+    )
+    assert result == {
+        "columns": ["region", "count(*)", "avg(id)", "min(id)"],
+        "rows": [],
+        "row_count": 0,
+    }
+
+
+def test_same_column_multiple_aggregates(tmp_path):
+    (tmp_path / "t.csv").write_text("g,v\na,1\na,3\nb,10\n", encoding="utf-8")
+    result = execute(
+        str(tmp_path),
+        "SELECT g, count(*), sum(v), avg(v), min(v), max(v) FROM t GROUP BY g",
+    )
+    assert result["rows"] == [
+        ["a", 2, 4, 2, 1, 3],
+        ["b", 1, 10, 10, 10, 10],
+    ]
+
+
+def test_avg_min_max_multi_column_grouping(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "r,p,v\nx,a,1\nx,a,3\nx,b,4\ny,a,10\n", encoding="utf-8"
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT r, p, count(*), avg(v), min(v), max(v) FROM t GROUP BY r, p",
+    )
+    assert result["rows"] == [
+        ["x", "a", 2, 2, 1, 3],
+        ["x", "b", 1, 4, 4, 4],
+        ["y", "a", 1, 10, 10, 10],
+    ]
+
+
+def test_having_avg_min_max_grouped(data_dir):
+    base = (
+        "SELECT region, count(*), avg(amount), min(amount), max(amount) "
+        "FROM sales WHERE id != 4 GROUP BY region HAVING "
+    )
+    result = execute(str(data_dir), base + "avg(amount) > 15")
+    assert result["rows"] == [["east", 2, 20, 10, 30]]
+    result = execute(str(data_dir), base + "min(amount) < 0 AND max(amount) > 20")
+    assert result["rows"] == [
+        ["west", 2, Decimal("9.125"), Decimal("-2.25"), Decimal("20.5")]
+    ]
+    result = execute(str(data_dir), base + "avg(amount) = 20 OR min(amount) = -2.25")
+    assert result["row_count"] == 2
+
+
+def test_having_avg_global(tmp_path):
+    (tmp_path / "t.csv").write_text("v\n1\n2\n3\n", encoding="utf-8")
+    result = execute(
+        str(tmp_path), "SELECT count(*), avg(v) FROM t HAVING avg(v) = 2"
+    )
+    assert result["rows"] == [[3, 2]]
+    result = execute(
+        str(tmp_path), "SELECT count(*), avg(v) FROM t HAVING avg(v) > 2"
+    )
+    assert result["rows"] == []
+    assert result["row_count"] == 0
+
+
+def test_having_empty_global_new_aggregates_always_false(data_dir):
+    base = (
+        "SELECT count(*), avg(id), min(id), max(id) FROM sales "
+        "WHERE id > 100 HAVING "
+    )
+    for cond in (
+        "avg(id) >= 0",
+        "min(id) != 0",
+        "max(id) < 100",
+        "avg(id) = 0 OR min(id) = 0",
+    ):
+        result = execute(str(data_dir), base + cond)
+        assert result["rows"] == []
+        assert result["row_count"] == 0
+    # count(*) is still computed on the empty global row.
+    result = execute(str(data_dir), base + "count(*) = 0")
+    assert result["rows"] == [[0, None, None, None]]
+    assert result["row_count"] == 1
+
+
+def test_order_by_avg_min_max(data_dir):
+    base = (
+        "SELECT region, count(*), avg(amount), min(amount), max(amount) "
+        "FROM sales WHERE id != 4 GROUP BY region ORDER BY "
+    )
+    result = execute(str(data_dir), base + "avg(amount) DESC")
+    assert [r[0] for r in result["rows"]] == ["east", "west"]
+    result = execute(str(data_dir), base + "min(amount)")
+    assert [r[0] for r in result["rows"]] == ["west", "east"]
+    result = execute(str(data_dir), base + "max(amount) DESC, region DESC")
+    assert [r[0] for r in result["rows"]] == ["east", "west"]
+    result = execute(str(data_dir), base + "max(amount) LIMIT 1")
+    assert result["rows"] == [["west", 2, Decimal("9.125"), Decimal("-2.25"), Decimal("20.5")]]
+
+
+def test_avg_min_max_unknown_column_raises_keyerror(data_dir):
+    with pytest.raises(KeyError):
+        execute(str(data_dir), "SELECT count(*), avg(missing) FROM sales")
+    with pytest.raises(KeyError):
+        execute(
+            str(data_dir),
+            "SELECT region, count(*), min(missing) FROM sales GROUP BY region",
+        )
+
+
+def test_avg_min_max_across_batch_sizes(tmp_path, monkeypatch):
+    import olap_turbo.engine as engine_mod
+
+    n = BATCH_SIZE * 2 + 7
+    (tmp_path / "big.csv").write_text(
+        "g,v\n" + "".join(f"{'ab'[i % 2]},{i}\n" for i in range(n)),
+        encoding="utf-8",
+    )
+    sql = "SELECT g, count(*), avg(v), min(v), max(v) FROM big GROUP BY g"
+    expected = execute(str(tmp_path), sql)
+    assert expected["row_count"] == 2
+    for size in (1, 3, 7, BATCH_SIZE + 1):
+        monkeypatch.setattr(engine_mod, "BATCH_SIZE", size)
+        assert execute(str(tmp_path), sql) == expected
+
+
+def test_parse_sql_avg_min_max_shape():
+    from olap_turbo.sql import HavingComparison, SortItem
+
+    q = parse_sql("SELECT count(*), avg(a), min(a), max(b) FROM t")
+    assert [item.kind for item in q.select] == ["count_star", "avg", "min", "max"]
+    assert q.select[1].text == "avg(a)"
+    assert q.required_columns() == ("a", "b")
+    q = parse_sql(
+        "SELECT g, count(*), avg(v) FROM t GROUP BY g "
+        "HAVING avg(v) > 1 ORDER BY avg(v) DESC LIMIT 3"
+    )
+    assert isinstance(q.having, HavingComparison)
+    assert (q.having.kind, q.having.column, q.having.op) == ("avg", "v", ">")
+    assert q.order_by == (SortItem("avg(v)", "avg", "v", True),)
+    assert q.limit == 3
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # each aggregate expression may appear only once
+        "SELECT count(*), avg(a), avg(a) FROM t",
+        "SELECT count(*), min(a), min(a) FROM t",
+        "SELECT count(*), max(b), sum(b), max(b) FROM t",
+        "SELECT a, count(*), avg(x), avg(x) FROM t GROUP BY a",
+        "SELECT a, count(*), min(x), max(x), min(x) FROM t GROUP BY a",
+        # grouping columns may not be aggregated
+        "SELECT a, count(*), avg(a) FROM t GROUP BY a",
+        "SELECT a, count(*), min(a) FROM t GROUP BY a",
+        "SELECT a, count(*), max(a) FROM t GROUP BY a",
+        # aggregates still require the aggregate query shape
+        "SELECT avg(a) FROM t",
+        "SELECT min(a), count(*) FROM t",
+        "SELECT a, avg(b) FROM t",
+        "SELECT a, count(*), max(b) FROM t",
+        # unselected aggregates in HAVING / ORDER BY
+        "SELECT count(*), avg(a) FROM t HAVING max(a) > 1",
+        "SELECT a, count(*), avg(b) FROM t GROUP BY a HAVING min(b) > 1",
+        "SELECT count(*), avg(a) FROM t ORDER BY min(a)",
+        "SELECT count(*), avg(a) FROM t ORDER BY avg(a), avg(a)",
+        # still-unsupported functions stay rejected everywhere
+        "SELECT count(*), median(a) FROM t",
+        "SELECT count(*), avg(a) FROM t HAVING median(a) > 1",
+        "SELECT count(*), avg(a) FROM t ORDER BY median(a)",
+    ],
+)
+def test_bad_avg_min_max_sql_raises_valueerror(tmp_path, sql):
+    (tmp_path / "t.csv").write_text("a,b,x\n1,2,3\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        execute(str(tmp_path), sql)
+
+
+def test_avg_min_max_cli(data_dir):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "olap_turbo",
+            "--data-dir",
+            str(data_dir),
+            "--query",
+            "SELECT count(*), avg(id), min(id), max(id) FROM sales WHERE id <= 2",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(proc.stdout)
+    assert payload == {
+        "columns": ["count(*)", "avg(id)", "min(id)", "max(id)"],
+        "rows": [[2, 1.5, 1, 2]],
+        "row_count": 1,
+    }

@@ -8,6 +8,11 @@ column-op-value comparisons — is evaluated column-at-a-time *before*
 projection or grouping (predicate pushdown), and aggregates — either a
 single global row or per-group hash tables keyed by one GROUP BY column
 or a tuple of several GROUP BY columns — roll forward batch by batch.
+Besides ``count(*)``, the column aggregates are ``sum``, ``avg``, ``min``
+and ``max``: sums and average accumulators add every matched row's cell,
+min/max keep the extreme value seen so far. On an empty filtered input the
+global ``avg``/``min``/``max`` results are null (and compare false in
+HAVING) while ``sum`` is 0; empty inputs produce no groups at all.
 HAVING, when present, is evaluated only after the aggregates have been
 exactly computed: it drops the global row or individual groups, never
 individual input rows.
@@ -35,7 +40,7 @@ from __future__ import annotations
 import csv
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .sql import (
     Comparison,
@@ -49,6 +54,14 @@ from .sql import (
 )
 
 BATCH_SIZE = 1024
+
+# Column aggregates over finite decimals, besides count(*).
+_AGG_KINDS = ("sum", "avg", "min", "max")
+
+# Aggregate state and final values are keyed by (kind, column); a state's
+# value is a running Decimal for sum/avg, the extreme Decimal so far for
+# min/max (None until a row matches).
+_AggKey = Tuple[str, str]
 
 
 def _decimal(field: str, column: str) -> Decimal:
@@ -149,23 +162,28 @@ def _evaluate_predicate(
 
 
 def _eval_having(
-    node: HavingExpr, count: int, sums: Dict[str, Decimal]
+    node: HavingExpr, count: int, values: Dict[_AggKey, Optional[Decimal]]
 ) -> bool:
     """Evaluate a HAVING tree against one fully computed aggregate row.
 
     Left operands are always numeric (an integer row count or an exactly
-    summed Decimal); textual aggregate results are never coerced, and the
-    right operands are the parser-validated finite decimal literals.
+    computed Decimal aggregate); textual aggregate results are never
+    coerced, and the right operands are the parser-validated finite decimal
+    literals. A null aggregate — avg/min/max over an empty global input —
+    makes its comparison false.
     """
     if isinstance(node, HavingComparison):
         if node.kind == "count_star":
             left: Decimal = Decimal(count)
         else:
-            left = sums[node.column]
+            value = values[(node.kind, node.column)]
+            if value is None:
+                return False
+            left = value
         return _compare(left, node.op, Decimal(node.value_text))
     if node.op == "AND":
-        return all(_eval_having(operand, count, sums) for operand in node.operands)
-    return any(_eval_having(operand, count, sums) for operand in node.operands)
+        return all(_eval_having(operand, count, values) for operand in node.operands)
+    return any(_eval_having(operand, count, values) for operand in node.operands)
 
 
 def _project_value(field: str) -> Any:
@@ -182,7 +200,7 @@ def _project_value(field: str) -> Any:
 
 
 def _number(value: Decimal) -> Any:
-    """Render an aggregate sum as int when integral, else keep Decimal."""
+    """Render an aggregate value as int when integral, else keep Decimal."""
     if value == value.to_integral_value():
         return int(value)
     return value
@@ -210,13 +228,74 @@ def _key_output(key: Any) -> Any:
     return key
 
 
-def _aggregate_result(query: Query, count: int, sums: Dict[str, Decimal]) -> Dict[str, Any]:
+def _new_agg_state(agg_items: Sequence[SelectItem]) -> Dict[_AggKey, Optional[Decimal]]:
+    """Fresh per-row-stream aggregate state.
+
+    sum/avg start at a zero running sum; min/max start empty (None) until
+    the first matched row supplies a value.
+    """
+    state: Dict[_AggKey, Optional[Decimal]] = {}
+    for item in agg_items:
+        key = (item.kind, item.column)
+        state[key] = None if item.kind in ("min", "max") else Decimal(0)
+    return state
+
+
+def _accumulate(
+    state: Dict[_AggKey, Optional[Decimal]],
+    agg_items: Sequence[SelectItem],
+    row: Sequence[str],
+    col_index: Dict[str, int],
+) -> None:
+    """Roll one matched row into the aggregate state."""
+    for item in agg_items:
+        idx = col_index[item.column]
+        field = row[idx] if idx < len(row) else ""
+        value = _decimal(field, item.column)
+        key = (item.kind, item.column)
+        current = state[key]
+        if item.kind in ("sum", "avg"):
+            state[key] = current + value
+        elif item.kind == "min":
+            if current is None or value < current:
+                state[key] = value
+        else:  # "max"
+            if current is None or value > current:
+                state[key] = value
+
+
+def _final_values(
+    agg_items: Sequence[SelectItem],
+    count: int,
+    state: Dict[_AggKey, Optional[Decimal]],
+) -> Dict[_AggKey, Optional[Decimal]]:
+    """Finalize one aggregate state into output values.
+
+    avg divides its exact running sum by the exact row count (Decimal
+    division, free of binary-float artifacts); min/max stay as recorded.
+    On an empty input avg/min/max are None (JSON null) while sum is 0.
+    """
+    final: Dict[_AggKey, Optional[Decimal]] = {}
+    for item in agg_items:
+        key = (item.kind, item.column)
+        value = state[key]
+        if item.kind == "avg":
+            final[key] = None if count == 0 else value / count
+        else:
+            final[key] = value
+    return final
+
+
+def _aggregate_result(
+    query: Query, count: int, values: Dict[_AggKey, Optional[Decimal]]
+) -> Dict[str, Any]:
     row: List[Any] = []
     for item in query.select:
         if item.kind == "count_star":
             row.append(count)
         else:
-            row.append(_number(sums[item.column]))
+            value = values[(item.kind, item.column)]
+            row.append(None if value is None else _number(value))
     return {
         "columns": [item.text for item in query.select],
         "rows": [row],
@@ -228,7 +307,7 @@ def _grouped_result(
     query: Query,
     order: List[Tuple[Any, ...]],
     counts: Dict[Tuple[Any, ...], int],
-    sums: Dict[Tuple[Any, ...], Dict[str, Decimal]],
+    values: Dict[Tuple[Any, ...], Dict[_AggKey, Optional[Decimal]]],
 ) -> Dict[str, Any]:
     group_cols = query.group_by
     rows: List[List[Any]] = []
@@ -241,7 +320,8 @@ def _grouped_result(
             elif item.kind == "count_star":
                 row.append(counts[key])
             else:
-                row.append(_number(sums[key][item.column]))
+                value = values[key][(item.kind, item.column)]
+                row.append(None if value is None else _number(value))
         rows.append(row)
     return {
         "columns": [item.text for item in query.select],
@@ -300,21 +380,17 @@ def _run_batches(
 
     projected_rows: List[List[Any]] = []
     count = 0
-    sums: Dict[str, Decimal] = {
-        item.column: Decimal(0)
-        for item in query.select
-        if item.kind == "sum"
-    }
     select_cols: Tuple[SelectItem, ...] = query.select
+    agg_items = [item for item in select_cols if item.kind in _AGG_KINDS]
+    state = _new_agg_state(agg_items)
 
     if query.is_grouped:
         # First-appearance order of composite group keys over the
         # filtered row stream.
         order: List[Tuple[Any, ...]] = []
         group_counts: Dict[Tuple[Any, ...], int] = {}
-        group_sums: Dict[Tuple[Any, ...], Dict[str, Decimal]] = {}
+        group_states: Dict[Tuple[Any, ...], Dict[_AggKey, Optional[Decimal]]] = {}
         group_idxs = [col_index[name] for name in query.group_by]
-        sum_items = [item for item in select_cols if item.kind == "sum"]
 
         while True:
             batch = [row for _, row in zip(range(BATCH_SIZE), reader)]
@@ -335,23 +411,26 @@ def _run_batches(
                 )
                 if key not in group_counts:
                     group_counts[key] = 0
-                    group_sums[key] = {item.column: Decimal(0) for item in sum_items}
+                    group_states[key] = _new_agg_state(agg_items)
                     order.append(key)
                 group_counts[key] += 1
-                for item in sum_items:
-                    idx = col_index[item.column]
-                    sum_field = row[idx] if idx < len(row) else ""
-                    group_sums[key][item.column] += _decimal(sum_field, item.column)
+                _accumulate(group_states[key], agg_items, row, col_index)
 
+        # Finalize every group exactly before HAVING or output; groups
+        # always hold at least one row, so their avg/min/max are non-null.
+        group_values = {
+            key: _final_values(agg_items, group_counts[key], group_states[key])
+            for key in order
+        }
         if query.having is not None:
             # HAVING runs after every group has been exactly computed and
             # only drops whole groups; first-appearance order is preserved.
             order = [
                 key
                 for key in order
-                if _eval_having(query.having, group_counts[key], group_sums[key])
+                if _eval_having(query.having, group_counts[key], group_values[key])
             ]
-        return _grouped_result(query, order, group_counts, group_sums)
+        return _grouped_result(query, order, group_counts, group_values)
 
     while True:
         batch = [row for _, row in zip(range(BATCH_SIZE), reader)]
@@ -368,11 +447,7 @@ def _run_batches(
                 if not matched:
                     continue
                 count += 1
-                row = batch[i]
-                for item in select_cols:
-                    if item.kind == "sum":
-                        field = row[col_index[item.column]] if col_index[item.column] < len(row) else ""
-                        sums[item.column] += _decimal(field, item.column)
+                _accumulate(state, agg_items, batch[i], col_index)
         else:
             indices = [col_index[item.column] for item in select_cols]
             for i, matched in enumerate(mask):
@@ -387,9 +462,10 @@ def _run_batches(
                 )
 
     if query.is_aggregate:
-        result = _aggregate_result(query, count, sums)
+        values = _final_values(agg_items, count, state)
+        result = _aggregate_result(query, count, values)
         if query.having is not None and not _eval_having(
-            query.having, count, sums
+            query.having, count, values
         ):
             # A global aggregate always computes one row; HAVING failing
             # leaves the same columns but no rows.
