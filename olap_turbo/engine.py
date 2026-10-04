@@ -12,6 +12,15 @@ HAVING, when present, is evaluated only after the aggregates have been
 exactly computed: it drops the global row or individual groups, never
 individual input rows.
 
+ORDER BY, when present, sorts the surviving result rows — after WHERE,
+aggregation and HAVING — by one or more SELECT result columns, each with
+its own ASC (default) or DESC direction. Finite-decimal values compare by
+exact numeric value (``1`` equals ``1.0``); everything else compares by
+raw text, never coerced to a number. Multi-item keys compare left to
+right; rows equal on every key keep their incoming order (CSV row order
+for projections, first-appearance order for groups). LIMIT, when present,
+truncates the sorted rows last.
+
 Every cell read by a numeric comparison is parsed eagerly for every row
 of a batch, even on rows whose other OR branches already settle the
 outcome: OR never short-circuits cell validation, so a non-numeric cell
@@ -34,6 +43,7 @@ from .sql import (
     HavingExpr,
     Query,
     SelectItem,
+    SortItem,
     WhereExpr,
     parse_sql,
 )
@@ -240,6 +250,47 @@ def _grouped_result(
     }
 
 
+def _sort_key(value: Any) -> Tuple[int, Any]:
+    """Order key for one result cell.
+
+    Finite decimals (already int/Decimal after projection, key rendering or
+    aggregation) compare by exact numeric value, so ``1`` and ``1.0`` tie;
+    everything else compares by raw text and is never coerced to a number.
+    Numbers order before text so mixed columns stay deterministic.
+    """
+    if isinstance(value, (int, Decimal)) and not isinstance(value, bool):
+        return (0, Decimal(value))
+    return (1, str(value))
+
+
+def _apply_order_by(
+    result: Dict[str, Any],
+    order_by: Tuple[SortItem, ...],
+    select: Tuple[SelectItem, ...],
+) -> None:
+    """Sort result rows in place, one stable pass per item, last item first.
+
+    Each sort item was validated against the SELECT list at parse time, so
+    its column position always resolves. Stability keeps rows that tie on
+    every key in their incoming order (CSV row order for projections,
+    first-appearance order for groups).
+    """
+    rows = result["rows"]
+    for item in reversed(order_by):
+        idx = next(
+            pos
+            for pos, si in enumerate(select)
+            if si.kind == item.kind and si.column == item.column
+        )
+        rows.sort(key=lambda row, i=idx: _sort_key(row[i]), reverse=item.descending)
+
+
+def _apply_limit(result: Dict[str, Any], limit: int) -> None:
+    """Truncate result rows in place; LIMIT 0 keeps columns, empties rows."""
+    del result["rows"][limit:]
+    result["row_count"] = len(result["rows"])
+
+
 def _run_batches(
     reader: csv.reader,
     query: Query,
@@ -427,7 +478,13 @@ def execute(data_dir: str, sql: str) -> Dict[str, Any]:
                 raise KeyError(
                     f"column {name!r} does not exist in table {query.table!r}"
                 )
-        return _run_batches(reader, query, header)
+        result = _run_batches(reader, query, header)
+        # ORDER BY sorts the fully computed result rows; LIMIT truncates last.
+        if query.order_by:
+            _apply_order_by(result, query.order_by, query.select)
+        if query.limit is not None:
+            _apply_limit(result, query.limit)
+        return result
 
 
 def render(result: Dict[str, Any]) -> str:

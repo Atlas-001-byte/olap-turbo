@@ -516,8 +516,6 @@ def test_three_column_grouping(tmp_path):
         "SELECT a, count(*), sum(b), sum(b) FROM t GROUP BY a",
         # aggregate shape without a leading grouping column
         "SELECT count(*), sum(a) FROM t GROUP BY a",
-        # clauses other than WHERE/GROUP BY
-        "SELECT a, count(*), sum(b) FROM t GROUP BY a ORDER BY a",
         # GROUP BY without a column stays rejected; a multi-column GROUP BY
         # whose SELECT list omits a grouping column is rejected too.
         "SELECT a, count(*), sum(b) FROM t GROUP BY",
@@ -1150,6 +1148,387 @@ def test_having_unknown_aggregate_still_valueerror_not_keyerror(data_dir):
         execute(str(data_dir), "SELECT count(*) FROM sales HAVING sum(nope) > 1")
 
 
+# ---------- ORDER BY ----------
+
+def test_order_by_projection_numeric_asc_desc(data_dir):
+    result = execute(str(data_dir), "SELECT id FROM sales ORDER BY id")
+    assert result["rows"] == [[1], [2], [3], [4], [5]]
+    result = execute(str(data_dir), "SELECT id FROM sales ORDER BY id DESC")
+    assert result["rows"] == [[5], [4], [3], [2], [1]]
+    result = execute(str(data_dir), "SELECT id FROM sales ORDER BY id ASC")
+    assert result["rows"] == [[1], [2], [3], [4], [5]]
+
+
+def test_order_by_projection_text_is_raw_text(data_dir):
+    result = execute(
+        str(data_dir), 'SELECT id, note FROM sales WHERE note != "" ORDER BY note'
+    )
+    assert result["rows"] == [[1, "a"], [2, "b"], [4, "x"], [5, "y"]]
+    result = execute(
+        str(data_dir),
+        'SELECT id, note FROM sales WHERE note != "" ORDER BY note DESC',
+    )
+    assert result["rows"] == [[5, "y"], [4, "x"], [2, "b"], [1, "a"]]
+
+
+def test_order_by_decimal_values_compare_exactly(tmp_path):
+    # 1, 1.0 and 01 are the same finite decimal: they tie and keep CSV order.
+    (tmp_path / "t.csv").write_text(
+        "k,v\n2,a\n1,b\n1.0,c\n01,d\n1.10,e\n", encoding="utf-8"
+    )
+    result = execute(str(tmp_path), "SELECT k, v FROM t ORDER BY k")
+    assert result["rows"] == [
+        [1, "b"],
+        [Decimal("1.0"), "c"],
+        [1, "d"],
+        [Decimal("1.10"), "e"],
+        [2, "a"],
+    ]
+    # DESC reverses the key comparison but ties still keep CSV order.
+    result = execute(str(tmp_path), "SELECT k, v FROM t ORDER BY k DESC")
+    assert [r[1] for r in result["rows"]] == ["a", "e", "b", "c", "d"]
+
+
+def test_order_by_mixed_column_numbers_before_text(data_dir):
+    # amount holds 10, 20.5, 30, "abc", -2.25: finite decimals order
+    # numerically, the text cell is never coerced and sorts after numbers.
+    result = execute(str(data_dir), "SELECT id, amount FROM sales ORDER BY amount")
+    assert [r[0] for r in result["rows"]] == [5, 1, 2, 3, 4]
+    result = execute(
+        str(data_dir), "SELECT id, amount FROM sales ORDER BY amount DESC"
+    )
+    assert [r[0] for r in result["rows"]] == [4, 3, 2, 1, 5]
+
+
+def test_order_by_multiple_items_and_ties_keep_csv_order(data_dir):
+    result = execute(
+        str(data_dir), "SELECT region, id FROM sales ORDER BY region, id DESC"
+    )
+    assert result["rows"] == [
+        ["east", 4],
+        ["east", 3],
+        ["east", 1],
+        ["west", 5],
+        ["west", 2],
+    ]
+    # Ties on the only key preserve the original CSV row order.
+    result = execute(str(data_dir), "SELECT id, region FROM sales ORDER BY region")
+    assert [r[0] for r in result["rows"]] == [1, 3, 4, 2, 5]
+
+
+def test_order_by_runs_after_where(data_dir):
+    result = execute(
+        str(data_dir),
+        'SELECT id FROM sales WHERE region = "east" ORDER BY id DESC',
+    )
+    assert result["rows"] == [[4], [3], [1]]
+    assert result["row_count"] == 3
+
+
+def test_order_by_global_aggregate(data_dir):
+    result = execute(
+        str(data_dir), "SELECT count(*), sum(id) FROM sales ORDER BY count(*) DESC"
+    )
+    assert result["columns"] == ["count(*)", "sum(id)"]
+    assert result["rows"] == [[5, 15]]
+    assert result["row_count"] == 1
+    result = execute(
+        str(data_dir), "SELECT count(*), sum(id) FROM sales ORDER BY sum(id)"
+    )
+    assert result["rows"] == [[5, 15]]
+
+
+def test_order_by_grouped_aggregates(data_dir):
+    base = (
+        "SELECT region, count(*), sum(amount) FROM sales "
+        "WHERE id != 4 GROUP BY region "
+    )
+    result = execute(str(data_dir), base + "ORDER BY sum(amount) DESC")
+    assert result["rows"] == [["east", 2, 40], ["west", 2, 18.25]]
+    result = execute(str(data_dir), base + "ORDER BY sum(amount)")
+    assert result["rows"] == [["west", 2, 18.25], ["east", 2, 40]]
+    result = execute(str(data_dir), base + "ORDER BY region DESC")
+    assert result["rows"] == [["west", 2, 18.25], ["east", 2, 40]]
+
+
+def test_order_by_grouped_ties_keep_first_appearance_order(data_dir):
+    # Both regions have count 2: the tie keeps east (first in CSV) ahead.
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(id) FROM sales WHERE id != 4 "
+        "GROUP BY region ORDER BY count(*)",
+    )
+    assert result["rows"] == [["east", 2, 4], ["west", 2, 7]]
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(id) FROM sales WHERE id != 4 "
+        "GROUP BY region ORDER BY count(*) DESC, region DESC",
+    )
+    assert result["rows"] == [["west", 2, 7], ["east", 2, 4]]
+
+
+def test_order_by_grouped_decimal_keys(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "k,v\n1.10,1\nx,2\n1,3\n1.0,4\n", encoding="utf-8"
+    )
+    result = execute(
+        str(tmp_path), "SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k"
+    )
+    # Numeric keys order by exact value before the text key.
+    assert result["rows"] == [[1, 2, 7], [Decimal("1.10"), 1, 1], ["x", 1, 2]]
+
+
+def test_order_by_after_having(data_dir):
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(id) FROM sales GROUP BY region "
+        "HAVING count(*) >= 2 ORDER BY sum(id) DESC",
+    )
+    assert result["rows"] == [["east", 3, 8], ["west", 2, 7]]
+    result = execute(
+        str(data_dir),
+        "SELECT count(*), sum(id) FROM sales HAVING count(*) > 1 "
+        "ORDER BY count(*)",
+    )
+    assert result["rows"] == [[5, 15]]
+
+
+def test_order_by_multi_column_grouping(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "r,p,v\nx,a,1\ny,b,2\nx,a,3\nx,b,4\ny,a,5\n", encoding="utf-8"
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT r, p, count(*), sum(v) FROM t GROUP BY r, p "
+        "ORDER BY count(*) DESC, sum(v)",
+    )
+    assert result["rows"] == [
+        ["x", "a", 2, 4],
+        ["y", "b", 1, 2],
+        ["x", "b", 1, 4],
+        ["y", "a", 1, 5],
+    ]
+
+
+def test_order_by_direction_keywords_case_insensitive(data_dir):
+    result = execute(str(data_dir), "SELECT id FROM sales ORDER BY id desc")
+    assert result["rows"] == [[5], [4], [3], [2], [1]]
+    result = execute(str(data_dir), "SELECT id FROM sales ORDER BY id Asc")
+    assert result["rows"] == [[1], [2], [3], [4], [5]]
+
+
+def test_order_by_across_batch_sizes(tmp_path, monkeypatch):
+    import olap_turbo.engine as engine_mod
+
+    n = BATCH_SIZE * 2 + 7
+    (tmp_path / "big.csv").write_text(
+        "k,v\n" + "".join(f"{'ab'[i % 2]},{i}\n" for i in range(n)),
+        encoding="utf-8",
+    )
+    projection_sql = "SELECT v FROM big ORDER BY v DESC"
+    grouped_sql = "SELECT k, count(*), sum(v) FROM big GROUP BY k ORDER BY sum(v) DESC"
+    expected_proj = execute(str(tmp_path), projection_sql)
+    expected_grp = execute(str(tmp_path), grouped_sql)
+    assert [r[0] for r in expected_proj["rows"][:3]] == [n - 1, n - 2, n - 3]
+    assert expected_grp["rows"][0][0] == "a"  # even rows sum higher
+    for size in (1, 3, 7, BATCH_SIZE + 1):
+        monkeypatch.setattr(engine_mod, "BATCH_SIZE", size)
+        assert execute(str(tmp_path), projection_sql) == expected_proj
+        assert execute(str(tmp_path), grouped_sql) == expected_grp
+
+
+# ---------- LIMIT ----------
+
+def test_limit_projection_keeps_csv_order(data_dir):
+    result = execute(str(data_dir), "SELECT id FROM sales LIMIT 2")
+    assert result["columns"] == ["id"]
+    assert result["rows"] == [[1], [2]]
+    assert result["row_count"] == 2
+
+
+def test_limit_zero_keeps_columns(data_dir):
+    result = execute(str(data_dir), "SELECT id, region FROM sales LIMIT 0")
+    assert result == {"columns": ["id", "region"], "rows": [], "row_count": 0}
+    result = execute(str(data_dir), "SELECT count(*) FROM sales LIMIT 0")
+    assert result == {"columns": ["count(*)"], "rows": [], "row_count": 0}
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(id) FROM sales GROUP BY region LIMIT 0",
+    )
+    assert result == {
+        "columns": ["region", "count(*)", "sum(id)"],
+        "rows": [],
+        "row_count": 0,
+    }
+
+
+def test_limit_larger_than_result_is_a_noop(data_dir):
+    result = execute(str(data_dir), "SELECT id FROM sales LIMIT 100")
+    assert result["row_count"] == 5
+    result = execute(str(data_dir), "SELECT count(*) FROM sales LIMIT 100")
+    assert result["rows"] == [[5]]
+
+
+def test_limit_global_aggregate(data_dir):
+    result = execute(str(data_dir), "SELECT count(*), sum(id) FROM sales LIMIT 1")
+    assert result["rows"] == [[5, 15]]
+    assert result["row_count"] == 1
+
+
+def test_limit_grouped(data_dir):
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(id) FROM sales GROUP BY region LIMIT 1",
+    )
+    assert result["rows"] == [["east", 3, 8]]
+    assert result["row_count"] == 1
+
+
+def test_limit_applies_after_order_by(data_dir):
+    result = execute(
+        str(data_dir), "SELECT id FROM sales ORDER BY id DESC LIMIT 2"
+    )
+    assert result["rows"] == [[5], [4]]
+    assert result["row_count"] == 2
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(amount) FROM sales WHERE id != 4 "
+        "GROUP BY region HAVING count(*) >= 2 ORDER BY sum(amount) DESC LIMIT 1",
+    )
+    assert result["rows"] == [["east", 2, 40]]
+    assert result["row_count"] == 1
+
+
+def test_limit_leading_zeros_and_large_value(data_dir):
+    result = execute(str(data_dir), "SELECT id FROM sales LIMIT 007")
+    assert result["row_count"] == 5
+    result = execute(str(data_dir), "SELECT id FROM sales LIMIT 999999999999")
+    assert result["row_count"] == 5
+
+
+# ---------- ORDER BY / LIMIT parse shape ----------
+
+def test_parse_sql_order_by_and_limit_shape():
+    from olap_turbo.sql import SortItem
+
+    q = parse_sql("SELECT a, b FROM t ORDER BY a DESC, b LIMIT 5")
+    assert q.order_by == (
+        SortItem("a", "column", "a", True),
+        SortItem("b", "column", "b", False),
+    )
+    assert q.limit == 5
+    q = parse_sql("SELECT g, count(*), sum(v) FROM t GROUP BY g ORDER BY sum(v) DESC")
+    assert q.order_by == (SortItem("sum(v)", "sum", "v", True),)
+    assert q.limit is None
+    q = parse_sql("SELECT count(*) FROM t ORDER BY count(*)")
+    assert q.order_by == (SortItem("count(*)", "count_star", None, False),)
+    # No new clauses: defaults stay empty.
+    q = parse_sql("SELECT a FROM t")
+    assert q.order_by == ()
+    assert q.limit is None
+
+
+# ---------- ORDER BY / LIMIT error forms ----------
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # sort items must reference result columns
+        "SELECT a FROM t ORDER BY b",                      # unselected column
+        "SELECT a FROM t ORDER BY count(*)",               # aggregate on projection
+        "SELECT a FROM t ORDER BY sum(a)",                 # aggregate on projection
+        "SELECT count(*) FROM t ORDER BY a",               # plain column on aggregate
+        "SELECT count(*) FROM t ORDER BY sum(a)",          # unselected sum
+        "SELECT count(*), sum(a) FROM t ORDER BY sum(b)",  # other sum
+        "SELECT a, count(*), sum(b) FROM t GROUP BY a ORDER BY b",   # unselected column
+        # duplicate sort items
+        "SELECT a, b FROM t ORDER BY a, a",
+        "SELECT a FROM t ORDER BY a ASC, a DESC",
+        "SELECT count(*) FROM t ORDER BY count(*), count(*)",
+        "SELECT count(*), sum(a) FROM t ORDER BY sum(a), sum(a)",
+        # malformed sort items
+        "SELECT a FROM t ORDER BY",          # missing item
+        "SELECT a FROM t ORDER BY 1",        # number
+        "SELECT a FROM t ORDER BY *",        # star
+        "SELECT a FROM t ORDER BY avg(a)",   # unsupported function
+        "SELECT a FROM t ORDER BY count(a)", # unsupported function
+        "SELECT a FROM t ORDER BY (a)",      # parenthesized
+        "SELECT a FROM t ORDER BY a b",      # missing comma
+        "SELECT a FROM t ORDER a",           # missing BY
+        "SELECT a FROM t BY a",              # BY without ORDER
+        # clause order and repetition
+        "SELECT a FROM t LIMIT 1 ORDER BY a",
+        "SELECT a FROM t ORDER BY a ORDER BY a",
+        "SELECT a FROM t LIMIT 1 LIMIT 2",
+        "SELECT a FROM t ORDER BY a WHERE a = 1",
+        "SELECT a FROM t ORDER BY a GROUP BY a",
+        "SELECT count(*) FROM t ORDER BY count(*) HAVING count(*) > 1",
+        "SELECT count(*) FROM t LIMIT 1 HAVING count(*) > 1",
+        # LIMIT must be a non-negative decimal integer literal
+        "SELECT a FROM t LIMIT",             # missing value
+        "SELECT a FROM t LIMIT -1",          # negative
+        "SELECT a FROM t LIMIT 1.5",         # fraction
+        "SELECT a FROM t LIMIT 1.0",         # decimal point
+        'SELECT a FROM t LIMIT "3"',         # string
+        "SELECT a FROM t LIMIT a",           # column
+        "SELECT a FROM t LIMIT 1+1",         # expression
+        "SELECT a FROM t LIMIT 1 1",         # trailing token
+    ],
+)
+def test_bad_order_by_limit_sql_raises_valueerror(tmp_path, sql):
+    (tmp_path / "t.csv").write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        execute(str(tmp_path), sql)
+
+
+def test_order_by_grouped_sum_ok(tmp_path):
+    (tmp_path / "t.csv").write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+    result = execute(
+        str(tmp_path),
+        "SELECT a, count(*), sum(b) FROM t GROUP BY a ORDER BY sum(b) DESC",
+    )
+    assert result["rows"] == [[3, 1, 4], [1, 1, 2]]
+
+
+def test_order_by_unknown_selected_column_still_keyerror(data_dir):
+    with pytest.raises(KeyError):
+        execute(str(data_dir), "SELECT missing FROM sales ORDER BY missing")
+    # But an unselected ORDER BY column is a ValueError, never a KeyError.
+    with pytest.raises(ValueError):
+        execute(str(data_dir), "SELECT id FROM sales ORDER BY missing")
+
+
+def test_order_by_limit_missing_table_still_filenotfound(data_dir):
+    with pytest.raises(FileNotFoundError):
+        execute(str(data_dir), "SELECT id FROM nope ORDER BY id LIMIT 1")
+
+
+def test_order_by_limit_no_derived_files_written(data_dir):
+    before = {p.name for p in data_dir.iterdir()}
+    execute(str(data_dir), "SELECT id FROM sales ORDER BY id DESC LIMIT 2")
+    assert {p.name for p in data_dir.iterdir()} == before
+
+
+def test_order_by_limit_cli(data_dir):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "olap_turbo",
+            "--data-dir",
+            str(data_dir),
+            "--query",
+            "SELECT id FROM sales ORDER BY id DESC LIMIT 2",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(proc.stdout)
+    assert payload == {"columns": ["id"], "rows": [[5], [4]], "row_count": 2}
+
+
 # ---------- error contract ----------
 
 def test_missing_table_raises_filenotfound(data_dir):
@@ -1180,7 +1559,6 @@ def test_unknown_column_raises_keyerror(data_dir):
         "SELECT a, count(*) FROM sales",       # mixed
         "SELECT sum(a) FROM sales",            # sum without count(*)
         "SELECT a FROM sales GROUP BY a",      # unsupported clause
-        "SELECT a FROM sales ORDER BY a",
         "SELECT a FROM sales WHERE a = 'x'",   # single quotes
         "SELECT a FROM sales WHERE a = 1x",    # malformed value
         "SELECT a FROM 'sales'",               # quoted table

@@ -5,6 +5,8 @@ Supported grammar (the complete surface for this baseline)::
     query      := SELECT select_list FROM identifier
                   [ WHERE boolean ] [ GROUP BY identifier (, identifier)* ]
                   [ HAVING having_boolean ]
+                  [ ORDER BY sort_item (, sort_item)* ] [ LIMIT integer ]
+    sort_item  := (identifier | count_star | sum_expr) [ ASC | DESC ]
     select_list:= grouping_column (, grouping_column)*,
                   count_star, sum_expr (, sum_expr)*   (grouped aggregate query)
                 | count_star [, sum_expr ]*            (aggregate query)
@@ -38,6 +40,15 @@ There is no NOT, no constant truth value and no other expression forms.
 HAVING may appear at most once and only after GROUP BY (or after WHERE in
 an ungrouped aggregate query); it is rejected on plain projection queries.
 
+ORDER BY follows HAVING (or WHERE/GROUP BY when HAVING is absent) and LIMIT
+follows ORDER BY; each may appear at most once and never out of order. Each
+sort item references a result column already in the SELECT list — a plain or
+grouping column, ``count(*)`` or ``sum(column)`` — with an optional ``ASC``
+(default) or ``DESC`` direction; duplicate sort items and references to
+expressions absent from the SELECT list are rejected. LIMIT takes a single
+non-negative decimal integer literal (digits only: no sign, no fraction, no
+strings, columns or expressions).
+
 A grouped query names one or more distinct grouping columns (at least two
 for the multi-column shape): they must head the SELECT list in the same
 order as the GROUP BY list, followed by count(*) and one or more distinct
@@ -68,7 +79,10 @@ class _TokKind(Enum):
     EOF = "eof"
 
 
-_KEYWORDS = {"SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "GROUP", "BY", "HAVING"}
+_KEYWORDS = {
+    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "GROUP", "BY", "HAVING",
+    "ORDER", "LIMIT",
+}
 
 
 @dataclass
@@ -215,12 +229,28 @@ class SelectItem:
 
 
 @dataclass(frozen=True)
+class SortItem:
+    """One ORDER BY item: a result-column reference with a direction.
+
+    ``text`` is the normalized expression text (``a``, ``count(*)``,
+    ``sum(a)``); ``kind``/``column`` mirror :class:`SelectItem`.
+    """
+
+    text: str
+    kind: str  # "column" | "count_star" | "sum"
+    column: Optional[str] = None
+    descending: bool = False
+
+
+@dataclass(frozen=True)
 class Query:
     select: Tuple[SelectItem, ...]
     table: str
     where: Optional[WhereExpr] = None
     group_by: Tuple[str, ...] = ()
     having: Optional[HavingExpr] = None
+    order_by: Tuple[SortItem, ...] = ()
+    limit: Optional[int] = None
 
     @property
     def is_aggregate(self) -> bool:
@@ -297,6 +327,8 @@ class _Parser:
         where: Optional[WhereExpr] = None
         having: Optional[HavingExpr] = None
         group_by: List[str] = []
+        order_by: List[SortItem] = []
+        limit: Optional[int] = None
         tok = self._peek()
         if tok.kind is _TokKind.KEYWORD and tok.text == "WHERE":
             self._next()
@@ -320,13 +352,39 @@ class _Parser:
                 raise ValueError("HAVING is only valid on aggregate queries")
             self._validate_having_aggregates(having, items)
             tok = self._peek()
+        if tok.kind is _TokKind.KEYWORD and tok.text == "ORDER":
+            self._next()
+            self._expect_keyword("BY")
+            order_by = [self._parse_sort_item(items)]
+            while self._peek().kind is _TokKind.COMMA:
+                self._next()
+                order_by.append(self._parse_sort_item(items))
+            seen_items = set()
+            for sort_item in order_by:
+                key = (sort_item.kind, sort_item.column)
+                if key in seen_items:
+                    raise ValueError(
+                        f"duplicate ORDER BY item {sort_item.text!r}"
+                    )
+                seen_items.add(key)
+            tok = self._peek()
+        if tok.kind is _TokKind.KEYWORD and tok.text == "LIMIT":
+            self._next()
+            limit = self._parse_limit()
+            tok = self._peek()
         if tok.kind is not _TokKind.EOF:
-            # Trailing tokens: unsupported clause (ORDER BY, ...), a second
-            # HAVING, a clause out of order, an unmatched ')' or plain
+            # Trailing tokens: an unsupported clause, a second ORDER BY or
+            # LIMIT, a clause out of order, an unmatched ')' or plain
             # malformed input.
             raise ValueError(f"unsupported or unexpected token {tok.text!r}")
         return Query(
-            tuple(items), table_tok.text, where, tuple(group_by), having
+            tuple(items),
+            table_tok.text,
+            where,
+            tuple(group_by),
+            having,
+            tuple(order_by),
+            limit,
         )
 
     def _validate_grouped(
@@ -569,6 +627,75 @@ class _Parser:
         raise ValueError(
             f"HAVING aggregate {node.text} is not in the SELECT list"
         )
+
+    # ----- ORDER BY / LIMIT -----
+
+    def _parse_sort_item(self, items: List[SelectItem]) -> SortItem:
+        tok = self._peek()
+        if (
+            tok.kind is _TokKind.IDENT
+            and self.tokens[self.pos + 1].kind is _TokKind.LPAREN
+        ):
+            name_tok = self._next()
+            self._next()  # (
+            inner = self._next()
+            self._expect(_TokKind.RPAREN)
+            upper = name_tok.text.upper()
+            if upper == "COUNT" and inner.kind is _TokKind.STAR:
+                text, kind, column = "count(*)", "count_star", None
+            elif upper == "SUM" and inner.kind is _TokKind.IDENT:
+                text, kind, column = f"sum({inner.text})", "sum", inner.text
+            else:
+                raise ValueError(
+                    "ORDER BY may only reference result columns, count(*) "
+                    "or sum(column)"
+                )
+        elif tok.kind is _TokKind.IDENT:
+            self._next()
+            text, kind, column = tok.text, "column", tok.text
+        else:
+            # Numbers, strings, keywords, '*', parens, EOF: none can start
+            # a sort item.
+            raise ValueError(f"invalid ORDER BY item {tok.text!r}")
+        # ASC/DESC are contextual: they stay plain identifiers so a column
+        # named e.g. "asc" remains usable elsewhere in the grammar.
+        descending = False
+        nxt = self._peek()
+        if nxt.kind is _TokKind.IDENT and nxt.text.upper() in ("ASC", "DESC"):
+            self._next()
+            descending = nxt.text.upper() == "DESC"
+        sort_item = SortItem(text, kind, column, descending)
+        self._validate_sort_item(sort_item, items)
+        return sort_item
+
+    def _validate_sort_item(
+        self, sort_item: SortItem, items: List[SelectItem]
+    ) -> None:
+        """Every ORDER BY item must reference a column of the result."""
+        for item in items:
+            if item.kind == sort_item.kind and item.column == sort_item.column:
+                return
+        if sort_item.kind == "column":
+            raise ValueError(
+                f"ORDER BY column {sort_item.text!r} is not in the SELECT list"
+            )
+        raise ValueError(
+            f"ORDER BY aggregate {sort_item.text} is not in the SELECT list"
+        )
+
+    def _parse_limit(self) -> int:
+        tok = self._next()
+        if (
+            tok.kind is not _TokKind.NUMBER
+            or not tok.text.isascii()
+            or not tok.text.isdigit()
+        ):
+            # Negatives, fractions, strings, columns, expressions, missing
+            # values: LIMIT takes digits only.
+            raise ValueError(
+                "LIMIT must be followed by a non-negative decimal integer"
+            )
+        return int(tok.text)
 
 
 def parse_sql(sql: str) -> Query:
