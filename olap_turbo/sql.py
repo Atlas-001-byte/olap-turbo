@@ -5,10 +5,13 @@ Supported grammar (the complete surface for this baseline)::
     query      := SELECT select_list FROM identifier
                   [ WHERE boolean ] [ GROUP BY identifier (, identifier)* ]
                   [ HAVING having_boolean ]
+                  [ ORDER BY order_item (, order_item)* ] [ LIMIT nonneg-int ]
     select_list:= grouping_column (, grouping_column)*,
                   count_star, sum_expr (, sum_expr)*   (grouped aggregate query)
                 | count_star [, sum_expr ]*            (aggregate query)
                 | column (, column)*                   (projection query)
+    order_item := order_key [ ASC | DESC ]
+    order_key  := column | count_star | sum_expr
     boolean    := or_expr
     or_expr    := and_expr (OR and_expr)*
     and_expr   := factor (AND factor)*
@@ -37,6 +40,22 @@ There is no NOT, no constant truth value and no other expression forms.
 
 HAVING may appear at most once and only after GROUP BY (or after WHERE in
 an ungrouped aggregate query); it is rejected on plain projection queries.
+
+ORDER BY may appear at most once and only after HAVING (or after GROUP BY /
+WHERE when HAVING is absent). Each sort key must be an expression already
+present in the result: a selected plain column on a projection query, or a
+grouping column / ``count(*)`` / ``sum(column)`` item on an aggregate query.
+Each key may carry ASC (the default) or DESC; duplicate keys, keys naming
+unselected columns or aggregates, and any other expression raise
+:class:`ValueError`.
+
+LIMIT may appear at most once and only after ORDER BY when ORDER BY is
+present (it otherwise follows HAVING/GROUP BY/WHERE directly). Its right
+side must be a run of decimal digits — a non-negative integer; signs,
+decimal points, quoted strings, columns and expressions are rejected.
+
+ORDER BY and LIMIT may not trade places, repeat, or precede any earlier
+clause.
 
 A grouped query names one or more distinct grouping columns (at least two
 for the multi-column shape): they must head the SELECT list in the same
@@ -68,7 +87,10 @@ class _TokKind(Enum):
     EOF = "eof"
 
 
-_KEYWORDS = {"SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "GROUP", "BY", "HAVING"}
+_KEYWORDS = {
+    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "GROUP", "BY",
+    "HAVING", "ORDER", "ASC", "DESC", "LIMIT",
+}
 
 
 @dataclass
@@ -215,12 +237,29 @@ class SelectItem:
 
 
 @dataclass(frozen=True)
+class OrderItem:
+    """One ORDER BY key: a result expression plus its direction.
+
+    Mirrors :class:`SelectItem`: ``kind`` is ``"column"``, ``"count_star"``
+    or ``"sum"`` (with ``column`` for the first and last); ``descending``
+    records DESC (ASC/default leaves it false).
+    """
+
+    text: str
+    kind: str
+    column: Optional[str] = None
+    descending: bool = False
+
+
+@dataclass(frozen=True)
 class Query:
     select: Tuple[SelectItem, ...]
     table: str
     where: Optional[WhereExpr] = None
     group_by: Tuple[str, ...] = ()
     having: Optional[HavingExpr] = None
+    order_by: Tuple[OrderItem, ...] = ()
+    limit: Optional[int] = None
 
     @property
     def is_aggregate(self) -> bool:
@@ -297,6 +336,8 @@ class _Parser:
         where: Optional[WhereExpr] = None
         having: Optional[HavingExpr] = None
         group_by: List[str] = []
+        order_by: List[OrderItem] = []
+        limit: Optional[int] = None
         tok = self._peek()
         if tok.kind is _TokKind.KEYWORD and tok.text == "WHERE":
             self._next()
@@ -320,13 +361,31 @@ class _Parser:
                 raise ValueError("HAVING is only valid on aggregate queries")
             self._validate_having_aggregates(having, items)
             tok = self._peek()
+        if tok.kind is _TokKind.KEYWORD and tok.text == "ORDER":
+            self._next()
+            self._expect_keyword("BY")
+            order_by = self._parse_order_items(items)
+            tok = self._peek()
+        elif tok.kind is _TokKind.KEYWORD and tok.text == "LIMIT":
+            # LIMIT without ORDER BY is allowed only as the final clause;
+            # anything after it is caught by the EOF check below.
+            self._next()
+            limit = self._parse_limit_value()
+            tok = self._peek()
+        if order_by:
+            # LIMIT, when present, must follow ORDER BY.
+            if tok.kind is _TokKind.KEYWORD and tok.text == "LIMIT":
+                self._next()
+                limit = self._parse_limit_value()
+                tok = self._peek()
         if tok.kind is not _TokKind.EOF:
-            # Trailing tokens: unsupported clause (ORDER BY, ...), a second
-            # HAVING, a clause out of order, an unmatched ')' or plain
-            # malformed input.
+            # Trailing tokens: an unsupported clause, a second
+            # ORDER BY/LIMIT/HAVING, a clause out of order, an unmatched
+            # ')' or plain malformed input.
             raise ValueError(f"unsupported or unexpected token {tok.text!r}")
         return Query(
-            tuple(items), table_tok.text, where, tuple(group_by), having
+            tuple(items), table_tok.text, where, tuple(group_by), having,
+            tuple(order_by), limit,
         )
 
     def _validate_grouped(
@@ -426,6 +485,79 @@ class _Parser:
         if tok.kind is not kind:
             raise ValueError(f"expected {kind.value} but found {tok.text!r}")
         return tok
+
+    # ----- ORDER BY / LIMIT tail clauses -----
+
+    def _parse_order_items(self, items: List[SelectItem]) -> List[OrderItem]:
+        order: List[OrderItem] = []
+        seen = set()
+        while True:
+            item = self._parse_order_item(items, seen)
+            order.append(item)
+            seen.add((item.kind, item.column))
+            if self._peek().kind is not _TokKind.COMMA:
+                return order
+            self._next()
+
+    def _parse_order_item(
+        self, items: List[SelectItem], seen: set
+    ) -> OrderItem:
+        tok = self._peek()
+        if tok.kind is _TokKind.IDENT and self.tokens[self.pos + 1].kind is _TokKind.LPAREN:
+            name_tok = self._next()
+            self._next()  # LPAREN
+            inner = self._next()
+            self._expect(_TokKind.RPAREN)
+            upper = name_tok.text.upper()
+            if upper == "COUNT" and inner.kind is _TokKind.STAR:
+                kind, column, text = "count_star", None, "count(*)"
+            elif upper == "SUM" and inner.kind is _TokKind.IDENT:
+                kind, column, text = "sum", inner.text, f"sum({inner.text})"
+            else:
+                raise ValueError(
+                    f"ORDER BY may only sort by selected result columns, "
+                    f"not {name_tok.text}({inner.text})"
+                )
+        elif tok.kind is _TokKind.IDENT:
+            self._next()
+            kind, column, text = "column", tok.text, tok.text
+        else:
+            # Keywords (including stray ASC/DESC with no key), numbers,
+            # strings, operators, EOF, ...: none name a result expression.
+            raise ValueError(
+                f"ORDER BY key must be a selected column or aggregate, "
+                f"not {tok.text!r}"
+            )
+        descending = False
+        direction = self._peek()
+        if direction.kind is _TokKind.KEYWORD and direction.text in ("ASC", "DESC"):
+            self._next()
+            descending = direction.text == "DESC"
+        # The key must already appear in the result's SELECT list.
+        if not any(
+            sel.kind == kind and (kind == "count_star" or sel.column == column)
+            for sel in items
+        ):
+            if kind == "column":
+                raise ValueError(
+                    f"ORDER BY column {column!r} is not in the SELECT list"
+                )
+            raise ValueError(
+                f"ORDER BY aggregate {text} is not in the SELECT list"
+            )
+        if (kind, column) in seen:
+            raise ValueError(f"duplicate ORDER BY key {text}")
+        return OrderItem(text, kind, column, descending)
+
+    def _parse_limit_value(self) -> int:
+        tok = self._next()
+        # A non-negative decimal integer written as a run of digits only:
+        # no sign, no decimal point, no exponent, no quoting, no identifier.
+        if tok.kind is not _TokKind.NUMBER or not tok.text.isdigit():
+            raise ValueError(
+                "LIMIT value must be a non-negative integer made of digits"
+            )
+        return int(tok.text)
 
     # ----- WHERE boolean grammar: or_expr := and_expr (OR and_expr)* -----
 

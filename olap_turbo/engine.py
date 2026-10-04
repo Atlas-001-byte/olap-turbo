@@ -10,7 +10,9 @@ single global row or per-group hash tables keyed by one GROUP BY column
 or a tuple of several GROUP BY columns — roll forward batch by batch.
 HAVING, when present, is evaluated only after the aggregates have been
 exactly computed: it drops the global row or individual groups, never
-individual input rows.
+individual input rows. ORDER BY then runs as a stable sort over the
+finished result rows (finite decimals compare exactly, other values by
+raw text), and LIMIT truncates the sorted rows last.
 
 Every cell read by a numeric comparison is parsed eagerly for every row
 of a batch, even on rows whose other OR branches already settle the
@@ -25,13 +27,15 @@ from __future__ import annotations
 
 import csv
 from decimal import Decimal, InvalidOperation
+from functools import cmp_to_key
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .sql import (
     Comparison,
     HavingComparison,
     HavingExpr,
+    OrderItem,
     Query,
     SelectItem,
     WhereExpr,
@@ -240,6 +244,83 @@ def _grouped_result(
     }
 
 
+def _sortable(value: Any):
+    """Map one rendered result cell to a comparison value.
+
+    Integers and exact :class:`Decimal` values sort numerically (so
+    ``1`` and ``1.0`` tie); every other value — including the empty
+    field and text that is not a finite decimal — sorts by its raw
+    string text, never by a forced numeric conversion.
+    """
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return Decimal(value)
+    return value
+
+
+def _compare_sort_value(left: Any, right: Any) -> int:
+    left_key = _sortable(left)
+    right_key = _sortable(right)
+    if isinstance(left_key, Decimal) and isinstance(right_key, Decimal):
+        # Exact finite decimal comparison: 1 and 1.0 are equivalent.
+        if left_key == right_key:
+            return 0
+        return -1 if left_key < right_key else 1
+    if isinstance(left_key, Decimal):
+        # Numeric keys never equal text keys; order the numeric ones first.
+        return -1
+    if isinstance(right_key, Decimal):
+        return 1
+    # Both are raw text: character-for-character comparison only.
+    if left_key == right_key:
+        return 0
+    return -1 if left_key < right_key else 1
+
+
+def _make_row_comparator(
+    order_by: Sequence[OrderItem],
+    column_positions: Dict[Tuple[str, Optional[str]], int],
+):
+    """Build the per-row comparator for a stable multi-key ORDER BY.
+
+    Equal sort keys leave the original row order intact (the input list
+    is already in CSV / first-group-appearance order, and Python's sort
+    is stable); DESC reverses only the key it is written on.
+    """
+    positions: List[Tuple[int, bool]] = [
+        (column_positions[(item.kind, item.column)], item.descending)
+        for item in order_by
+    ]
+
+    def compare(
+        left: Sequence[Any], right: Sequence[Any]
+    ) -> int:
+        for pos, descending in positions:
+            result = _compare_sort_value(left[pos], right[pos])
+            if result:
+                return -result if descending else result
+        return 0
+
+    return compare
+
+
+def _apply_order_and_limit(
+    result: Dict[str, Any], query: Query
+) -> Dict[str, Any]:
+    """Stable ORDER BY over finished rows, then LIMIT truncation."""
+    if query.order_by:
+        column_positions: Dict[Tuple[str, Optional[str]], int] = {}
+        for pos, item in enumerate(query.select):
+            column_positions[(item.kind, item.column)] = pos
+        comparator = _make_row_comparator(query.order_by, column_positions)
+        result["rows"].sort(key=cmp_to_key(comparator))
+    if query.limit is not None:
+        result["rows"] = result["rows"][: query.limit]
+        result["row_count"] = len(result["rows"])
+    return result
+
+
 def _run_batches(
     reader: csv.reader,
     query: Query,
@@ -300,7 +381,8 @@ def _run_batches(
                 for key in order
                 if _eval_having(query.having, group_counts[key], group_sums[key])
             ]
-        return _grouped_result(query, order, group_counts, group_sums)
+        result = _grouped_result(query, order, group_counts, group_sums)
+        return _apply_order_and_limit(result, query)
 
     while True:
         batch = [row for _, row in zip(range(BATCH_SIZE), reader)]
@@ -344,12 +426,13 @@ def _run_batches(
             # leaves the same columns but no rows.
             result["rows"] = []
             result["row_count"] = 0
-        return result
-    return {
+        return _apply_order_and_limit(result, query)
+    result = {
         "columns": [item.text for item in select_cols],
         "rows": projected_rows,
         "row_count": len(projected_rows),
     }
+    return _apply_order_and_limit(result, query)
 
 
 def _dumps(obj: Any) -> str:
