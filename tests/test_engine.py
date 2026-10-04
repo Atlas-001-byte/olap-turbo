@@ -516,9 +516,8 @@ def test_three_column_grouping(tmp_path):
         "SELECT a, count(*), sum(b), sum(b) FROM t GROUP BY a",
         # aggregate shape without a leading grouping column
         "SELECT count(*), sum(a) FROM t GROUP BY a",
-        # clauses other than WHERE/GROUP BY
+        # clauses other than WHERE/GROUP BY/HAVING
         "SELECT a, count(*), sum(b) FROM t GROUP BY a ORDER BY a",
-        "SELECT a, count(*), sum(b) FROM t GROUP BY a HAVING count(*) > 1",
         # GROUP BY without a column stays rejected; a multi-column GROUP BY
         # whose SELECT list omits a grouping column is rejected too.
         "SELECT a, count(*), sum(b) FROM t GROUP BY",
@@ -531,6 +530,257 @@ def test_bad_grouped_sql_raises_valueerror(tmp_path, sql):
     )
     with pytest.raises(ValueError):
         execute(str(tmp_path), sql)
+
+
+# ---------- HAVING ----------
+
+def test_having_global_aggregate_pass_and_fail(data_dir):
+    result = execute(
+        str(data_dir), "SELECT count(*), sum(id) FROM sales HAVING count(*) >= 5"
+    )
+    assert result == {"columns": ["count(*)", "sum(id)"], "rows": [[5, 15]], "row_count": 1}
+    result = execute(
+        str(data_dir), "SELECT count(*), sum(id) FROM sales HAVING count(*) > 5"
+    )
+    assert result == {"columns": ["count(*)", "sum(id)"], "rows": [], "row_count": 0}
+
+
+def test_having_global_aggregate_exact_decimal(data_dir):
+    # sum(amount) over id != 4 is exactly 58.25; decimal comparison is exact.
+    result = execute(
+        str(data_dir),
+        "SELECT count(*), sum(amount) FROM sales WHERE id != 4 "
+        "HAVING sum(amount) = 58.25",
+    )
+    assert result["rows"] == [[4, 58.25]]
+    result = execute(
+        str(data_dir),
+        "SELECT count(*), sum(amount) FROM sales WHERE id != 4 "
+        "HAVING sum(amount) = 58.250000001",
+    )
+    assert result["rows"] == []
+    assert result["row_count"] == 0
+
+
+def test_having_all_operators(data_dir):
+    base = "SELECT count(*) FROM sales HAVING count(*)"
+    assert execute(str(data_dir), f"{base} = 5")["row_count"] == 1
+    assert execute(str(data_dir), f"{base} != 5")["row_count"] == 0
+    assert execute(str(data_dir), f"{base} > 4")["row_count"] == 1
+    assert execute(str(data_dir), f"{base} >= 5")["row_count"] == 1
+    assert execute(str(data_dir), f"{base} < 6")["row_count"] == 1
+    assert execute(str(data_dir), f"{base} <= 5")["row_count"] == 1
+    assert execute(str(data_dir), f"{base} < 5")["row_count"] == 0
+
+
+def test_having_grouped_filters_groups_keeps_order(data_dir):
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(id) FROM sales GROUP BY region "
+        "HAVING count(*) >= 3",
+    )
+    # east has 3 rows, west has 2; only east survives.
+    assert result["columns"] == ["region", "count(*)", "sum(id)"]
+    assert result["rows"] == [["east", 3, 8]]
+    assert result["row_count"] == 1
+
+
+def test_having_grouped_sum_condition_and_first_appearance(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "g,v\nb,1\na,2\nb,3\na,4\nc,5\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT g, count(*), sum(v) FROM t GROUP BY g HAVING sum(v) >= 4",
+    )
+    # b (sum 4) first appeared before a (sum 6); c (sum 5) qualifies too.
+    assert result["rows"] == [["b", 2, 4], ["a", 2, 6], ["c", 1, 5]]
+    assert result["row_count"] == 3
+
+
+def test_having_grouped_no_survivors(data_dir):
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(id) FROM sales GROUP BY region "
+        "HAVING count(*) > 100",
+    )
+    assert result == {
+        "columns": ["region", "count(*)", "sum(id)"],
+        "rows": [],
+        "row_count": 0,
+    }
+
+
+def test_having_multi_column_grouping(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "r,p,v\n"
+        "x,a,1\n"
+        "y,b,2\n"
+        "x,a,3\n"
+        "x,b,4\n"
+        "y,a,5\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT r, p, count(*), sum(v) FROM t GROUP BY r, p "
+        "HAVING count(*) > 1 OR sum(v) >= 5",
+    )
+    assert result["rows"] == [["x", "a", 2, 4], ["y", "a", 1, 5]]
+    assert result["row_count"] == 2
+
+
+def test_having_boolean_precedence_and_parentheses(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "g,v\na,1\na,2\nb,10\nb,20\nb,30\n",
+        encoding="utf-8",
+    )
+    # AND binds tighter than OR: count(*) = 2, or count(*) = 3 and sum >= 100.
+    result = execute(
+        str(tmp_path),
+        "SELECT g, count(*), sum(v) FROM t GROUP BY g "
+        "HAVING count(*) = 2 OR count(*) = 3 AND sum(v) >= 100",
+    )
+    assert result["rows"] == [["a", 2, 3]]
+    # Parentheses override: (count = 2 or count = 3) and sum >= 10.
+    result = execute(
+        str(tmp_path),
+        "SELECT g, count(*), sum(v) FROM t GROUP BY g "
+        "HAVING (count(*) = 2 OR count(*) = 3) AND sum(v) >= 10",
+    )
+    assert result["rows"] == [["b", 3, 60]]
+    # Nested parentheses.
+    result = execute(
+        str(tmp_path),
+        "SELECT g, count(*), sum(v) FROM t GROUP BY g "
+        "HAVING ((count(*) = 2 OR count(*) = 3) AND (sum(v) < 10 OR sum(v) >= 60))",
+    )
+    assert result["rows"] == [["a", 2, 3], ["b", 3, 60]]
+
+
+def test_having_with_where_filters_after_aggregation(data_dir):
+    # WHERE removes row 4 (amount "abc") before grouping; HAVING then
+    # filters the per-group aggregates.
+    result = execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(amount) FROM sales WHERE id != 4 "
+        "GROUP BY region HAVING sum(amount) < 30",
+    )
+    assert result["rows"] == [["west", 2, 18.25]]
+    assert result["row_count"] == 1
+
+
+def test_having_negative_and_decimal_literals(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "g,v\na,-1.5\na,-2.5\nb,3\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT g, count(*), sum(v) FROM t GROUP BY g HAVING sum(v) <= -4.0",
+    )
+    assert result["rows"] == [["a", 2, -4]]
+    assert render(result) == (
+        '{"columns":["g","count(*)","sum(v)"],"rows":[["a",2,-4]],"row_count":1}'
+    )
+
+
+def test_having_reads_no_extra_columns(tmp_path):
+    (tmp_path / "t.csv").write_text(
+        "g,v,noise\na,1,garbage###\nb,2,not-a-number\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT g, count(*), sum(v) FROM t GROUP BY g HAVING sum(v) > 1",
+    )
+    assert result["rows"] == [["b", 1, 2]]
+
+
+def test_having_no_derived_files_written(data_dir):
+    before = {p.name for p in data_dir.iterdir()}
+    execute(
+        str(data_dir),
+        "SELECT region, count(*), sum(id) FROM sales GROUP BY region "
+        "HAVING count(*) >= 2",
+    )
+    assert {p.name for p in data_dir.iterdir()} == before
+
+
+def test_having_parse_tree_shape():
+    from olap_turbo.sql import BoolOp, HavingComparison
+
+    q = parse_sql(
+        "SELECT a, count(*), sum(b) FROM t GROUP BY a "
+        "HAVING count(*) > 1 OR sum(b) <= 2 AND count(*) != 9"
+    )
+    assert isinstance(q.having, BoolOp)
+    assert q.having.op == "OR"
+    first = q.having.operands[0]
+    assert isinstance(first, HavingComparison)
+    assert (first.kind, first.column, first.op, first.value_text) == (
+        "count_star",
+        None,
+        ">",
+        "1",
+    )
+    assert q.having.operands[1].op == "AND"
+    # No HAVING stays None.
+    assert parse_sql("SELECT count(*) FROM t").having is None
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # HAVING is not allowed on plain projection queries
+        "SELECT a FROM t HAVING count(*) > 1",
+        "SELECT a, b FROM t WHERE a = 1 HAVING count(*) > 1",
+        # HAVING must follow GROUP BY and appear at most once
+        "SELECT a, count(*), sum(x) FROM t HAVING count(*) > 1 GROUP BY a",
+        "SELECT count(*) FROM t HAVING count(*) > 1 HAVING count(*) < 9",
+        "SELECT count(*) FROM t HAVING count(*) > 1 WHERE a = 1",
+        # conditions must reference SELECTed aggregates only
+        "SELECT count(*) FROM t HAVING sum(x) > 1",
+        "SELECT a, count(*), sum(x) FROM t GROUP BY a HAVING sum(y) > 1",
+        "SELECT a, count(*), sum(x) FROM t GROUP BY a HAVING a > 1",
+        "SELECT a, count(*), sum(x) FROM t GROUP BY a HAVING x > 1",
+        "SELECT count(*), sum(x) FROM t HAVING avg(x) > 1",
+        "SELECT count(*), sum(x) FROM t HAVING count(x) > 1",
+        # the value must be an unquoted decimal number
+        "SELECT count(*) FROM t HAVING count(*) = \"1\"",
+        "SELECT count(*) FROM t HAVING count(*) = x",
+        # malformed boolean syntax mirrors the WHERE rules
+        "SELECT count(*) FROM t HAVING (count(*) > 1)",
+        "SELECT count(*) FROM t HAVING (count(*) > 1",
+        "SELECT count(*) FROM t HAVING count(*) > 1)",
+        "SELECT count(*) FROM t HAVING ()",
+        "SELECT count(*) FROM t HAVING count(*) >",
+        "SELECT count(*) FROM t HAVING count(*) > > 1",
+        "SELECT count(*) FROM t HAVING count(*) > 1 AND",
+        "SELECT count(*) FROM t HAVING AND count(*) > 1",
+        "SELECT count(*) FROM t HAVING count(*) > 1 OR",
+        "SELECT count(*) FROM t HAVING NOT count(*) > 1",
+        "SELECT count(*) FROM t HAVING count(*) > 1 count(*) < 9",
+        "SELECT count(*) FROM t HAVING",
+    ],
+)
+def test_bad_having_sql_raises_valueerror(tmp_path, sql):
+    (tmp_path / "t.csv").write_text(
+        "a,b,x,y\n1,2,3,4\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError):
+        execute(str(tmp_path), sql)
+
+
+def test_having_unknown_sum_column_raises_keyerror(data_dir):
+    # A HAVING aggregate absent from SELECT is a ValueError, but a sum()
+    # column missing from the table stays a KeyError.
+    with pytest.raises(KeyError):
+        execute(
+            str(data_dir),
+            "SELECT count(*), sum(missing) FROM sales HAVING count(*) > 1",
+        )
 
 
 # ---------- column pruning ----------

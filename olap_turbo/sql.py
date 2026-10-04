@@ -4,6 +4,7 @@ Supported grammar (the complete surface for this baseline)::
 
     query      := SELECT select_list FROM identifier
                   [ WHERE boolean ] [ GROUP BY identifier (, identifier)* ]
+                  [ HAVING having_boolean ]
     select_list:= grouping_column (, grouping_column)*,
                   count_star, sum_expr (, sum_expr)*   (grouped aggregate query)
                 | count_star [, sum_expr ]*            (aggregate query)
@@ -16,6 +17,12 @@ Supported grammar (the complete surface for this baseline)::
     op         := = | != | > | >= | < | <=
     value      := number-literal | double-quoted-string-literal
 
+    having_boolean    := having_or
+    having_or         := having_and (OR having_and)*
+    having_and        := having_factor (AND having_factor)*
+    having_factor     := LPAREN having_or RPAREN | having_comparison
+    having_comparison := (count_star | sum_expr) op number-literal
+
 AND binds tighter than OR; parentheses may be nested to override the
 precedence. Parentheses *combine* boolean conditions only: a parenthesized
 group must itself contain an AND/OR combination (``(a = 1)`` is rejected),
@@ -27,16 +34,27 @@ for the multi-column shape): they must head the SELECT list in the same
 order as the GROUP BY list, followed by count(*) and one or more distinct
 sum(column) expressions.
 
+HAVING may follow GROUP BY (or WHERE in a global aggregate query) at most
+once and filters the *aggregate* result: each condition compares a
+count(*) or sum(column) that already appears in the SELECT list against an
+unquoted finite decimal literal, and conditions combine with AND, OR and
+parentheses under the same rules as WHERE. HAVING on a plain projection
+query, a HAVING that references a plain/grouping column or an aggregate
+absent from SELECT, a quoted or non-numeric comparison value, a duplicate
+or mispositioned HAVING, and every malformed variant (unmatched
+parentheses, incomplete conditions, consecutive operators, NOT, ...)
+raise :class:`ValueError`.
+
 Anything else (missing FROM, NOT, functions other than count(*)/sum() in
 SELECT, wildcards, extra clauses, malformed syntax, unmatched parentheses,
-OR outside WHERE) raises :class:`ValueError`.
+OR outside WHERE/HAVING) raises :class:`ValueError`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 
 class _TokKind(Enum):
@@ -52,7 +70,7 @@ class _TokKind(Enum):
     EOF = "eof"
 
 
-_KEYWORDS = {"SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "GROUP", "BY"}
+_KEYWORDS = {"SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "GROUP", "BY", "HAVING"}
 
 
 @dataclass
@@ -170,6 +188,23 @@ WhereExpr = Union[Comparison, BoolOp]
 
 
 @dataclass(frozen=True)
+class HavingComparison:
+    """One SELECTed aggregate compared against a finite decimal literal.
+
+    ``kind`` is ``"count_star"`` or ``"sum"`` (with ``column`` set);
+    ``value_text`` is the raw unquoted decimal literal.
+    """
+
+    kind: str
+    column: Optional[str]
+    op: str
+    value_text: str
+
+
+HavingExpr = Union[HavingComparison, BoolOp]
+
+
+@dataclass(frozen=True)
 class SelectItem:
     # Original expression text as written in the query, e.g. "count(*)", "sum(a)".
     text: str
@@ -183,6 +218,7 @@ class Query:
     table: str
     where: Optional[WhereExpr] = None
     group_by: Tuple[str, ...] = ()
+    having: Optional[HavingExpr] = None
 
     @property
     def is_aggregate(self) -> bool:
@@ -258,6 +294,7 @@ class _Parser:
             raise ValueError("table name must be a simple identifier")
         where: Optional[WhereExpr] = None
         group_by: List[str] = []
+        having: Optional[HavingExpr] = None
         tok = self._peek()
         if tok.kind is _TokKind.KEYWORD and tok.text == "WHERE":
             self._next()
@@ -274,11 +311,17 @@ class _Parser:
             tok = self._peek()
         else:
             self._validate_ungrouped(items)
+        if tok.kind is _TokKind.KEYWORD and tok.text == "HAVING":
+            self._next()
+            having = self._parse_having_or()
+            self._validate_having(items, group_by, having)
+            tok = self._peek()
         if tok.kind is not _TokKind.EOF:
-            # Trailing tokens: unsupported clause (ORDER BY, HAVING, ...),
+            # Trailing tokens: an unsupported or mispositioned clause
+            # (ORDER BY, a second HAVING, HAVING before GROUP BY, ...),
             # an unmatched ')' or plain malformed input.
             raise ValueError(f"unsupported or unexpected token {tok.text!r}")
-        return Query(tuple(items), table_tok.text, where, tuple(group_by))
+        return Query(tuple(items), table_tok.text, where, tuple(group_by), having)
 
     def _validate_grouped(
         self, items: List[SelectItem], group_by: List[str]
@@ -348,6 +391,38 @@ class _Parser:
                     "count(*)/sum() cannot be mixed with plain columns"
                 )
 
+    def _validate_having(
+        self,
+        items: List[SelectItem],
+        group_by: List[str],
+        having: HavingExpr,
+    ) -> None:
+        """HAVING rides on aggregate queries only, and every condition must
+        compare an aggregate that already appears in the SELECT list."""
+        if not group_by and items[0].kind != "count_star":
+            raise ValueError("HAVING requires an aggregate query")
+        available = {
+            (item.kind, item.column)
+            for item in items
+            if item.kind in ("count_star", "sum")
+        }
+        self._check_having_node(having, available)
+
+    def _check_having_node(self, node: HavingExpr, available: set) -> None:
+        if isinstance(node, HavingComparison):
+            if (node.kind, node.column) not in available:
+                text = (
+                    "count(*)"
+                    if node.kind == "count_star"
+                    else f"sum({node.column})"
+                )
+                raise ValueError(
+                    f"HAVING references {text} which is not in the SELECT list"
+                )
+            return
+        for operand in node.operands:
+            self._check_having_node(operand, available)
+
     def _parse_select_item(self) -> SelectItem:
         tok = self._peek()
         # function form: ident '(' ... ')'
@@ -378,31 +453,47 @@ class _Parser:
             raise ValueError(f"expected {kind.value} but found {tok.text!r}")
         return tok
 
-    # ----- WHERE boolean grammar: or_expr := and_expr (OR and_expr)* -----
+    # ----- boolean grammar: or_expr := and_expr (OR and_expr)* -----
+    # WHERE and HAVING share the AND/OR/parentheses skeleton; only the leaf
+    # comparison differs (column-op-value vs aggregate-op-number).
 
     def _parse_or(self) -> WhereExpr:
-        operands = [self._parse_and()]
+        return self._parse_or_level(self._parse_factor)
+
+    def _parse_having_or(self) -> HavingExpr:
+        return self._parse_or_level(self._parse_having_factor)
+
+    def _parse_or_level(self, factor_parser) -> Any:
+        operands = [self._parse_and_level(factor_parser)]
         while self._accept_keyword("OR"):
-            operands.append(self._parse_and())
+            operands.append(self._parse_and_level(factor_parser))
         if len(operands) == 1:
             return operands[0]
         return BoolOp("OR", tuple(operands))
 
-    def _parse_and(self) -> WhereExpr:
-        operands = [self._parse_factor()]
+    def _parse_and_level(self, factor_parser) -> Any:
+        operands = [factor_parser()]
         while self._accept_keyword("AND"):
-            operands.append(self._parse_factor())
+            operands.append(factor_parser())
         if len(operands) == 1:
             return operands[0]
         return BoolOp("AND", tuple(operands))
 
     def _parse_factor(self) -> WhereExpr:
+        return self._parse_bool_factor(self._parse_comparison, self._parse_factor)
+
+    def _parse_having_factor(self) -> HavingExpr:
+        return self._parse_bool_factor(
+            self._parse_having_comparison, self._parse_having_factor
+        )
+
+    def _parse_bool_factor(self, comparison_parser, factor_parser) -> Any:
         tok = self._peek()
         if tok.kind is _TokKind.LPAREN:
             self._next()
-            node = self._parse_or()
+            node = self._parse_or_level(factor_parser)
             self._expect(_TokKind.RPAREN)
-            if isinstance(node, Comparison):
+            if not isinstance(node, BoolOp):
                 # Parentheses only *combine* boolean conditions; they may
                 # not wrap a single comparison, a column or a value.
                 raise ValueError(
@@ -411,7 +502,7 @@ class _Parser:
                 )
             return node
         if tok.kind is _TokKind.IDENT:
-            return self._parse_comparison()
+            return comparison_parser()
         # NOT, dangling AND/OR, ')', EOF, numbers, ...: none can start a
         # boolean condition.
         raise ValueError(f"expected a boolean condition but found {tok.text!r}")
@@ -429,6 +520,35 @@ class _Parser:
         raise ValueError(
             "comparison value must be an unquoted number or a double-quoted string"
         )
+
+    def _parse_having_comparison(self) -> HavingComparison:
+        name = self._expect(_TokKind.IDENT)
+        if self._peek().kind is not _TokKind.LPAREN:
+            raise ValueError(
+                "HAVING conditions must compare a count(*) or sum(column) "
+                "aggregate, not a plain column"
+            )
+        self._next()  # (
+        inner = self._next()
+        self._expect(_TokKind.RPAREN)
+        upper = name.text.upper()
+        if upper == "COUNT" and inner.kind is _TokKind.STAR:
+            kind, column = "count_star", None
+        elif upper == "SUM" and inner.kind is _TokKind.IDENT:
+            kind, column = "sum", inner.text
+        else:
+            raise ValueError(
+                f"unsupported HAVING aggregate {name.text}({inner.text})"
+            )
+        op_tok = self._expect(_TokKind.OP)
+        if op_tok.text not in _OPS:
+            raise ValueError(f"unsupported operator {op_tok.text!r}")
+        val = self._next()
+        if val.kind is not _TokKind.NUMBER:
+            raise ValueError(
+                "HAVING comparison value must be an unquoted decimal number"
+            )
+        return HavingComparison(kind, column, op_tok.text, val.text)
 
 
 def parse_sql(sql: str) -> Query:
