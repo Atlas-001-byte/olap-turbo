@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--query",
         required=True,
-        help="SQL query (SELECT ... FROM ... [WHERE ...])",
+        help="SQL query (SELECT ... FROM ... [WHERE ...] [GROUP BY ...] [HAVING ...])",
     )
     return parser
 

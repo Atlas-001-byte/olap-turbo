@@ -8,6 +8,9 @@ column-op-value comparisons — is evaluated column-at-a-time *before*
 projection or grouping (predicate pushdown), and aggregates — either a
 single global row or per-group hash tables keyed by one GROUP BY column
 or a tuple of several GROUP BY columns — roll forward batch by batch.
+HAVING, when present, is evaluated only after the aggregates have been
+exactly computed: it drops the global row or individual groups, never
+individual input rows.
 
 Every cell read by a numeric comparison is parsed eagerly for every row
 of a batch, even on rows whose other OR branches already settle the
@@ -25,7 +28,15 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
-from .sql import Comparison, Query, SelectItem, WhereExpr, parse_sql
+from .sql import (
+    Comparison,
+    HavingComparison,
+    HavingExpr,
+    Query,
+    SelectItem,
+    WhereExpr,
+    parse_sql,
+)
 
 BATCH_SIZE = 1024
 
@@ -125,6 +136,26 @@ def _evaluate_predicate(
 ) -> List[bool]:
     """Vectorized predicate tree; runs on raw columns, ahead of projection."""
     return _eval_node(where, rows, col_index)
+
+
+def _eval_having(
+    node: HavingExpr, count: int, sums: Dict[str, Decimal]
+) -> bool:
+    """Evaluate a HAVING tree against one fully computed aggregate row.
+
+    Left operands are always numeric (an integer row count or an exactly
+    summed Decimal); textual aggregate results are never coerced, and the
+    right operands are the parser-validated finite decimal literals.
+    """
+    if isinstance(node, HavingComparison):
+        if node.kind == "count_star":
+            left: Decimal = Decimal(count)
+        else:
+            left = sums[node.column]
+        return _compare(left, node.op, Decimal(node.value_text))
+    if node.op == "AND":
+        return all(_eval_having(operand, count, sums) for operand in node.operands)
+    return any(_eval_having(operand, count, sums) for operand in node.operands)
 
 
 def _project_value(field: str) -> Any:
@@ -261,6 +292,14 @@ def _run_batches(
                     sum_field = row[idx] if idx < len(row) else ""
                     group_sums[key][item.column] += _decimal(sum_field, item.column)
 
+        if query.having is not None:
+            # HAVING runs after every group has been exactly computed and
+            # only drops whole groups; first-appearance order is preserved.
+            order = [
+                key
+                for key in order
+                if _eval_having(query.having, group_counts[key], group_sums[key])
+            ]
         return _grouped_result(query, order, group_counts, group_sums)
 
     while True:
@@ -297,7 +336,15 @@ def _run_batches(
                 )
 
     if query.is_aggregate:
-        return _aggregate_result(query, count, sums)
+        result = _aggregate_result(query, count, sums)
+        if query.having is not None and not _eval_having(
+            query.having, count, sums
+        ):
+            # A global aggregate always computes one row; HAVING failing
+            # leaves the same columns but no rows.
+            result["rows"] = []
+            result["row_count"] = 0
+        return result
     return {
         "columns": [item.text for item in select_cols],
         "rows": projected_rows,
