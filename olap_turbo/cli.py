@@ -6,7 +6,7 @@ import argparse
 import sys
 from typing import Optional, Sequence
 
-from .engine import execute, render
+from .engine import execute, explain, render
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,11 +25,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="SQL query (SELECT ... FROM ... [INNER JOIN ... ON ...] "
         "[WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT n])",
     )
+    parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="print only the query plan JSON (headers are read, but no data "
+        "rows) instead of running the query",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.explain:
+        plan = explain(args.data_dir, args.query)
+        sys.stdout.write(render(plan) + "\n")
+        return 0
     result = execute(args.data_dir, args.query)
     sys.stdout.write(render(result) + "\n")
     return 0

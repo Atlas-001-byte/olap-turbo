@@ -812,6 +812,237 @@ def _json_string(text: str) -> str:
     return "".join(out)
 
 
+def _read_header(path: Path) -> List[str]:
+    """Read only a CSV table's header (first row); data rows are untouched."""
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh)
+        try:
+            return next(reader)
+        except StopIteration:
+            return []
+
+
+def _collect_where_columns_single(
+    node: WhereExpr, cols: List[str], seen: set
+) -> None:
+    """First-appearance order of the bare columns a single-table WHERE reads."""
+    if isinstance(node, Comparison):
+        if node.column not in seen:
+            seen.add(node.column)
+            cols.append(node.column)
+        return
+    for operand in node.operands:
+        _collect_where_columns_single(operand, cols, seen)
+
+
+def _aggregates_plan(query: Query) -> List[Dict[str, Any]]:
+    """SELECT aggregates in SELECT order; count(*) has a null column."""
+    aggregates: List[Dict[str, Any]] = []
+    for item in query.select:
+        if item.kind == "count_star":
+            aggregates.append(
+                {"function": "count", "column": None, "text": item.text}
+            )
+        elif item.kind in _AGG_KINDS:
+            aggregates.append(
+                {"function": item.kind, "column": item.column, "text": item.text}
+            )
+    return aggregates
+
+
+def _order_by_plan(query: Query) -> List[Dict[str, str]]:
+    return [
+        {
+            "expression": item.text,
+            "direction": "DESC" if item.descending else "ASC",
+        }
+        for item in query.order_by
+    ]
+
+
+def _query_type(query: Query) -> str:
+    if query.is_join:
+        return "join"
+    if query.is_grouped:
+        return "grouped_aggregate"
+    if query.is_aggregate:
+        return "aggregate"
+    return "projection"
+
+
+def _explain_single(data_dir: str, query: Query) -> Dict[str, Any]:
+    """Plan a single-table query; only the CSV header is read."""
+    table_path = Path(data_dir) / f"{query.table}.csv"
+    # Built-in open raises FileNotFoundError, preserving the required type.
+    header = _read_header(table_path)
+    required = query.required_columns()
+    for name in required:
+        if name not in header:
+            raise KeyError(
+                f"column {name!r} does not exist in table {query.table!r}"
+            )
+
+    # The scanner materializes exactly the required columns, in CSV header
+    # order; count(*) reads no column.
+    required_set = set(required)
+    scan_columns: List[str] = []
+    seen_scan: set = set()
+    for name in header:
+        if name in required_set and name not in seen_scan:
+            seen_scan.add(name)
+            scan_columns.append(name)
+
+    where_columns: List[str] = []
+    if query.where is not None:
+        _collect_where_columns_single(query.where, where_columns, set())
+
+    # SELECT selection originals, first appearance kept (aggregates are
+    # reported separately in "aggregates").
+    select_columns: List[str] = []
+    seen_select: set = set()
+    for item in query.select:
+        if item.kind == "column" and item.text not in seen_select:
+            seen_select.add(item.text)
+            select_columns.append(item.text)
+
+    return {
+        "query_type": _query_type(query),
+        "tables": [query.table],
+        "scan_columns": scan_columns,
+        "where_columns": where_columns,
+        "select_columns": select_columns,
+        "group_columns": list(query.group_by),
+        "aggregates": _aggregates_plan(query),
+        "join": None,
+        "order_by": _order_by_plan(query),
+        "limit": query.limit,
+    }
+
+
+def _collect_where_positions_ordered(
+    node: WhereExpr,
+    resolve,
+    positions: List[Tuple[int, int]],
+    seen: set,
+) -> None:
+    """Resolve WHERE columns in written order, each physical column once."""
+    if isinstance(node, Comparison):
+        position = resolve(node.table, node.column)
+        if position not in seen:
+            seen.add(position)
+            positions.append(position)
+        return
+    for operand in node.operands:
+        _collect_where_positions_ordered(operand, resolve, positions, seen)
+
+
+def _explain_join(data_dir: str, query: Query) -> Dict[str, Any]:
+    """Plan the single INNER JOIN query; only the two CSV headers are read."""
+    left_table = query.table
+    right_table = query.join_table
+    # The left (FROM) table is opened before the right (JOIN) table, just as
+    # in _run_join; built-in open raises FileNotFoundError.
+    left_header = _read_header(Path(data_dir) / f"{left_table}.csv")
+    right_header = _read_header(Path(data_dir) / f"{right_table}.csv")
+
+    def resolve(table: Optional[str], name: str) -> Tuple[int, int]:
+        return _resolve_join_column(
+            table, name, left_table, right_table, left_header, right_header
+        )
+
+    # ON, SELECT and WHERE are resolved exactly as during execution, so an
+    # unknown/ambiguous column raises KeyError/ValueError without a row read.
+    left_pos, right_pos = _resolve_on(
+        query.join_on, left_table, right_table, left_header, right_header
+    )
+    select_positions = [
+        resolve(item.table, item.column) for item in query.select
+    ]
+    where_positions: List[Tuple[int, int]] = []
+    if query.where is not None:
+        _collect_where_positions_ordered(
+            query.where, resolve, where_positions, set()
+        )
+
+    # Mirror the execution-time ORDER BY validation: duplicates by resolved
+    # column and sort items absent from the SELECT list are ValueErrors.
+    order_seen: set = set()
+    for sort_item in query.order_by:
+        position = resolve(sort_item.table, sort_item.column)
+        if position in order_seen:
+            raise ValueError(f"duplicate ORDER BY item {sort_item.text!r}")
+        order_seen.add(position)
+        if position not in select_positions:
+            raise ValueError(
+                f"ORDER BY column {sort_item.text!r} is not in the "
+                "SELECT list"
+            )
+
+    headers = (left_header, right_header)
+    tables = (left_table, right_table)
+
+    def qualified(position: Tuple[int, int]) -> str:
+        side, idx = position
+        return f"{tables[side]}.{headers[side][idx]}"
+
+    # Every column the join actually materializes: the two ON keys, the
+    # SELECT columns and the WHERE columns, left table first in each header's
+    # column order, then the right table.
+    scan_set = {left_pos, right_pos}
+    scan_set.update(select_positions)
+    scan_set.update(where_positions)
+    scan_columns = [
+        qualified((side, idx))
+        for side in (0, 1)
+        for idx in sorted(p[1] for p in scan_set if p[0] == side)
+    ]
+
+    where_columns = [qualified(position) for position in where_positions]
+
+    select_columns: List[str] = []
+    seen_select: set = set()
+    for item in query.select:
+        if item.text not in seen_select:
+            seen_select.add(item.text)
+            select_columns.append(item.text)
+
+    return {
+        "query_type": "join",
+        "tables": [left_table, right_table],
+        "scan_columns": scan_columns,
+        "where_columns": where_columns,
+        "select_columns": select_columns,
+        "group_columns": [],
+        "aggregates": [],
+        "join": {
+            "left_table": left_table,
+            "right_table": right_table,
+            "left_column": left_header[left_pos[1]],
+            "right_column": right_header[right_pos[1]],
+        },
+        "order_by": _order_by_plan(query),
+        "limit": query.limit,
+    }
+
+
+def explain(data_dir: str, sql: str) -> Dict[str, Any]:
+    """Return the query plan for *sql* as a JSON-serializable dict.
+
+    Only the CSV headers are read, never data rows: column pruning, predicate
+    pushdown and the execution order are described statically. Non-numeric
+    cells never fail.
+
+    Raises:
+        FileNotFoundError: a table's CSV file does not exist.
+        KeyError: the query references a column absent from a header.
+        ValueError: the SQL is malformed/unsupported.
+    """
+    query: Query = parse_sql(sql)
+    if query.is_join:
+        return _explain_join(data_dir, query)
+    return _explain_single(data_dir, query)
+
+
 def execute(data_dir: str, sql: str) -> Dict[str, Any]:
     """Run *sql* against CSV tables in *data_dir*; return a result dict.
 

@@ -16,6 +16,27 @@
 python -m olap_turbo --data-dir <目录> --query <SQL>
 ```
 
+加 `--explain` 时不执行查询，只输出查询计划 JSON（仍需 `--query`）：
+
+```
+python -m olap_turbo --data-dir <目录> --query <SQL> --explain
+```
+
+- 计划只读取 CSV 表头，不读数据行：非数字单元格不会导致计划失败；表不存在抛 `FileNotFoundError`，列不存在抛 `KeyError`，SQL 无效或不支持抛 `ValueError`（与执行路径同一套解析与表头列校验）。
+- 输出是一个计划对象，字段固定为：
+  - `query_type`：`projection`、`aggregate`、`grouped_aggregate` 或 `join`。
+  - `tables`：表名数组，顺序同 FROM、JOIN。
+  - `scan_columns`：实际读取的列，按 CSV 表头顺序；单表写列名，连接写 `表名.列名`，`count(*)` 不出现。
+  - `where_columns`：WHERE 引用的列，按首次出现去重。
+  - `select_columns`：SELECT 中普通列/分组列的选择项原文，按首次出现去重（聚合表达式不在此列）。
+  - `group_columns`：GROUP BY 列（按其顺序），无分组时为 `[]`。
+  - `aggregates`：SELECT 中聚合按 SELECT 顺序排列的对象，含 `function`（函数小写名，`count(*)` 为 `"count"`）、`column`（`count(*)` 为 `null`）、`text`（表达式原文）；HAVING 只引用其中已有项。
+  - `join`：非连接查询为 `null`；连接查询为含 `left_table`、`right_table`、`left_column`、`right_column` 的对象。
+  - `order_by`：排序项原序数组，每项含 `expression`（表达式原文）与 `direction`（`ASC` 或 `DESC`），无子句时为 `[]`。
+  - `limit`：非负整数或 `null`。
+- 字符串一律使用源文本，数字与空值使用 JSON 原生值；计划不含耗时、行数或其他统计，也不混入 `rows` 或 `row_count`。
+- Python 入口为 `olap_turbo.explain(data_dir, sql)`，返回与上述 JSON 等价的字典；`execute(data_dir, sql)` 与不带 `--explain` 的命令行行为保持不变。
+
 - 表为 `<目录>/<表名>.csv`，表名为去掉 `.csv` 的文件名；首行为列名，后续每行为记录。
 - 普通查询：`SELECT 列 [, 列 ...] FROM 表 [WHERE 条件]`，输出 `columns`、`rows`、`row_count`。
 - 两表内连接：`SELECT 选择项, 选择项 FROM 左表 INNER JOIN 右表 ON 左列 = 右列 [WHERE 条件] [ORDER BY 排序项...] [LIMIT n]`。两张表分别从 `<目录>/<左表>.csv` 与 `<目录>/<右表>.csv` 读取，本形态只支持恰好一次 INNER JOIN，不支持别名、LEFT JOIN、多段 JOIN、GROUP BY、HAVING 或聚合 SELECT（出现这些写法抛出 `ValueError`）。SELECT、ON、WHERE、ORDER BY 中可用 `表名.列名` 限定列；不带前缀的列在两张表中唯一归属一张表时可直接引用，若在两表中重名则必须加表名限定，否则抛出 `ValueError`；左右表同名也抛出 `ValueError`。ON 必须恰好是一对分别来自左右两表的列以 `=` 相等比较：不能比较字面量、不能引用同一张表的两列、不能用 `=` 以外的运算符、不能用 AND/OR 组合多个条件或再写一段 JOIN，否则抛出 `ValueError`（ON 列可写不带前缀的列名，但两列必须分别唯一归属两张表）。连接键两边都是有限十进制数时按精确数值相等匹配（`1` 与 `1.0` 相配），否则一律按原文精确比较，数值与文本永不相配。每个左行按左表 CSV 行序、对每个左行按右表 CSV 行序连接全部匹配的右行（一对多全部展开）；连接完成后才执行 WHERE，随后按 SELECT 投影，再做稳定 ORDER BY（完全相同的排序键保留连接行序）与最后的 LIMIT。`columns` 按 SELECT 顺序保留带表名限定的选择项原文文本；`LIMIT 0` 保留原 `columns`、`rows` 为 `[]`、`row_count` 为 0。
