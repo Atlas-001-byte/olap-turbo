@@ -1940,3 +1940,366 @@ def test_avg_min_max_cli(data_dir):
         "rows": [[2, 1.5, 1, 2]],
         "row_count": 1,
     }
+
+
+# ---------- INNER JOIN ----------
+
+@pytest.fixture()
+def join_dir(tmp_path: Path) -> Path:
+    # orders references customers by cust; note 1, 1.0 and 01 are the same
+    # finite decimal; "1" text in cust_key must never match a numeric 1.
+    (tmp_path / "orders.csv").write_text(
+        "oid,cust,amt\n"
+        "10,1,100\n"
+        "11,1.0,50.5\n"
+        "12,01,25\n"
+        "13,x,7\n"
+        "14,2,9\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "customers.csv").write_text(
+        "cust_key,name\n"
+        "1.00,alpha\n"
+        "x,beta\n"
+        "2,gamma\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_join_basic_expansion_and_columns(join_dir):
+    result = execute(
+        str(join_dir),
+        "SELECT orders.oid, customers.name, orders.amt "
+        "FROM orders INNER JOIN customers ON orders.cust = customers.cust_key",
+    )
+    assert result["columns"] == ["orders.oid", "customers.name", "orders.amt"]
+    # Left CSV order; each left row's matches in right CSV order: rows 10-12
+    # all match alpha, 13 -> beta, 14 (key 2) matches gamma.
+    assert result["rows"] == [
+        [10, "alpha", 100],
+        [11, "alpha", 50.5],
+        [12, "alpha", 25],
+        [13, "beta", 7],
+        [14, "gamma", 9],
+    ]
+    assert result["row_count"] == 5
+
+
+def test_join_decimal_keys_match_exactly(join_dir):
+    # 1 == 1.0 == 01 == 1.00 by exact decimal value; text "1" never matches.
+    result = execute(
+        str(join_dir),
+        "SELECT orders.oid FROM orders INNER JOIN customers "
+        "ON customers.cust_key = orders.cust",
+    )
+    assert [r[0] for r in result["rows"]] == [10, 11, 12, 13, 14]
+
+
+def test_join_bare_columns_unique_per_side(join_dir):
+    # cust / cust_key / oid / name are unique across the headers; bare
+    # references resolve to their owning table, including in ON.
+    result = execute(
+        str(join_dir),
+        "SELECT oid, name FROM orders INNER JOIN customers ON cust = cust_key",
+    )
+    assert result["rows"] == [
+        [10, "alpha"],
+        [11, "alpha"],
+        [12, "alpha"],
+        [13, "beta"],
+        [14, "gamma"],
+    ]
+    assert result["row_count"] == 5
+
+
+def test_join_multiple_right_matches_keep_csv_orders(tmp_path):
+    (tmp_path / "l.csv").write_text(
+        "lid,lk\n"
+        "10,1\n"
+        "20,1\n"
+        "30,2\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "r.csv").write_text(
+        "rk,rname\n"
+        "1,A\n"
+        "1,B\n"
+        "2,C\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT lid, rname FROM l INNER JOIN r ON lk = rk",
+    )
+    assert result["rows"] == [
+        [10, "A"], [10, "B"], [20, "A"], [20, "B"], [30, "C"],
+    ]
+    # ORDER BY preserves join order on ties and sorts by exact value.
+    result = execute(
+        str(tmp_path),
+        "SELECT lid, rname FROM l INNER JOIN r ON lk = rk ORDER BY rname, lid",
+    )
+    assert result["rows"] == [
+        [10, "A"], [20, "A"], [10, "B"], [20, "B"], [30, "C"],
+    ]
+
+
+def test_join_numeric_text_keys_never_match(tmp_path):
+    (tmp_path / "l.csv").write_text("k,v\n1,a\n,b\ntwo,c\n", encoding="utf-8")
+    (tmp_path / "r.csv").write_text("k,w\none,W1\ntwo,W2\n,W3\n", encoding="utf-8")
+    # Numeric 1 never matches text "one"; text "two" and empty do match.
+    result = execute(
+        str(tmp_path),
+        "SELECT v, w FROM l INNER JOIN r ON l.k = r.k ORDER BY w",
+    )
+    assert result["rows"] == [["c", "W2"], ["b", "W3"]]
+    assert result["row_count"] == 2
+    # A genuine non-numeric join key never matches a numeric one.
+    (tmp_path / "m.csv").write_text("k\none\n", encoding="utf-8")
+    result = execute(
+        str(tmp_path),
+        "SELECT v FROM l INNER JOIN m ON l.k = m.k",
+    )
+    assert result["rows"] == []
+
+
+def test_join_where_runs_after_join(join_dir):
+    result = execute(
+        str(join_dir),
+        "SELECT orders.oid, customers.name FROM orders INNER JOIN customers "
+        'ON orders.cust = customers.cust_key WHERE orders.oid >= 12 AND name = "alpha"',
+    )
+    assert result["rows"] == [[12, "alpha"]]
+    # A qualified right-table predicate in an AND/OR tree works as usual.
+    result = execute(
+        str(join_dir),
+        "SELECT orders.oid FROM orders INNER JOIN customers "
+        'ON orders.cust = customers.cust_key '
+        'WHERE customers.name = "beta" OR orders.oid = 10',
+    )
+    assert [r[0] for r in result["rows"]] == [10, 13]
+
+
+def test_join_order_by_and_limit(join_dir):
+    result = execute(
+        str(join_dir),
+        "SELECT orders.oid, customers.name FROM orders INNER JOIN customers "
+        "ON orders.cust = customers.cust_key ORDER BY orders.oid DESC LIMIT 2",
+    )
+    assert result["rows"] == [[14, "gamma"], [13, "beta"]]
+    assert result["row_count"] == 2
+
+
+def test_join_limit_zero_keeps_columns(join_dir):
+    result = execute(
+        str(join_dir),
+        "SELECT orders.oid, customers.name FROM orders INNER JOIN customers "
+        "ON orders.cust = customers.cust_key LIMIT 0",
+    )
+    assert result == {
+        "columns": ["orders.oid", "customers.name"],
+        "rows": [],
+        "row_count": 0,
+    }
+
+
+def test_join_empty_match_and_empty_right(tmp_path):
+    (tmp_path / "l.csv").write_text("id,v\n1,a\n2,b\n", encoding="utf-8")
+    (tmp_path / "r.csv").write_text("id,w\n9,z\n", encoding="utf-8")
+    (tmp_path / "e.csv").write_text("id\n", encoding="utf-8")
+    result = execute(
+        str(tmp_path), "SELECT l.id, v FROM l INNER JOIN r ON l.id = r.id"
+    )
+    assert result == {"columns": ["l.id", "v"], "rows": [], "row_count": 0}
+    result = execute(
+        str(tmp_path), "SELECT l.id FROM l INNER JOIN e ON l.id = e.id"
+    )
+    assert result == {"columns": ["l.id"], "rows": [], "row_count": 0}
+
+
+def test_join_unreferenced_columns_ignored(tmp_path):
+    (tmp_path / "l.csv").write_text(
+        "id,k,noise\n1,1,not-a-number!!!\n2,1,####\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "r.csv").write_text(
+        "k,w,junk\n1,a,garbage###\n1,b,%%%%%\n",
+        encoding="utf-8",
+    )
+    result = execute(
+        str(tmp_path),
+        "SELECT id, w FROM l INNER JOIN r ON l.k = r.k",
+    )
+    assert result["rows"] == [[1, "a"], [1, "b"], [2, "a"], [2, "b"]]
+
+
+def test_join_numeric_predicate_eagerly_validated(tmp_path):
+    (tmp_path / "l.csv").write_text(
+        "id,k,v\n1,1,10\n2,1,abc\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "r.csv").write_text("k\n1\n", encoding="utf-8")
+    # The non-numeric cell belongs to a joined row the predicate reaches;
+    # OR does not short-circuit its validation.
+    with pytest.raises(ValueError):
+        execute(
+            str(tmp_path),
+            "SELECT l.id FROM l INNER JOIN r ON l.k = r.k "
+            'WHERE l.id = 1 OR l.v >= 0',
+        )
+
+
+def test_join_missing_table_raises_filenotfound(join_dir):
+    with pytest.raises(FileNotFoundError):
+        execute(
+            str(join_dir),
+            "SELECT orders.oid FROM orders INNER JOIN nope "
+            "ON orders.cust = nope.k",
+        )
+    with pytest.raises(FileNotFoundError):
+        execute(
+            str(join_dir),
+            "SELECT nope.oid FROM nope INNER JOIN customers "
+            "ON nope.cust = customers.cust_key",
+        )
+
+
+def test_join_unknown_column_raises_keyerror(join_dir):
+    base = "FROM orders INNER JOIN customers ON orders.cust = customers.cust_key"
+    with pytest.raises(KeyError):
+        execute(str(join_dir), f"SELECT missing, orders.oid {base}")
+    with pytest.raises(KeyError):
+        execute(str(join_dir), f"SELECT orders.oid {base} WHERE customers.missing = 1")
+    with pytest.raises(KeyError):
+        execute(
+            str(join_dir),
+            "SELECT orders.oid FROM orders INNER JOIN customers "
+            "ON orders.cust = missing",
+        )
+    with pytest.raises(KeyError):
+        execute(str(join_dir), f"SELECT orders.oid {base} WHERE customers.nope = 1")
+
+
+def test_join_ambiguous_bare_column_raises_valueerror(tmp_path):
+    (tmp_path / "l.csv").write_text("id,k\n1,1\n", encoding="utf-8")
+    (tmp_path / "r.csv").write_text("id,k\n1,1\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        execute(
+            str(tmp_path),
+            "SELECT id FROM l INNER JOIN r ON l.id = r.id",
+        )
+    with pytest.raises(ValueError):
+        execute(
+            str(tmp_path),
+            "SELECT l.id FROM l INNER JOIN r ON l.id = r.id WHERE id = 1",
+        )
+    # A bare ON column present in both headers is ambiguous too.
+    with pytest.raises(ValueError):
+        execute(
+            str(tmp_path),
+            "SELECT l.id FROM l INNER JOIN r ON k = r.id",
+        )
+
+
+def test_join_same_name_tables_raises_valueerror(join_dir):
+    with pytest.raises(ValueError):
+        execute(
+            str(join_dir),
+            "SELECT orders.oid FROM orders INNER JOIN orders "
+            "ON orders.cust = orders.oid",
+        )
+
+
+def test_join_unknown_qualifier_raises_valueerror(join_dir):
+    base = "FROM orders INNER JOIN customers ON orders.cust = customers.cust_key"
+    with pytest.raises(ValueError):
+        execute(str(join_dir), f"SELECT other.oid {base}")
+    with pytest.raises(ValueError):
+        execute(str(join_dir), f"SELECT orders.oid {base} WHERE other.cust = 1")
+    with pytest.raises(ValueError):
+        execute(str(join_dir), f"SELECT orders.oid {base} ORDER BY other.oid")
+    with pytest.raises(ValueError):
+        execute(
+            str(join_dir),
+            "SELECT orders.oid FROM orders INNER JOIN customers "
+            "ON orders.cust = other.cust_key",
+        )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # only INNER JOIN; no bare/LEFT/multiple joins
+        "SELECT oid FROM orders JOIN customers ON cust = cust_key",
+        "SELECT oid FROM orders LEFT JOIN customers ON cust = cust_key",
+        "SELECT oid FROM orders INNER JOIN customers ON cust = cust_key "
+        "INNER JOIN orders ON orders.oid = customers.cust_key",
+        # ON must be exactly one cross-table '=' equality
+        "SELECT oid FROM orders INNER JOIN customers ON cust > cust_key",
+        "SELECT oid FROM orders INNER JOIN customers ON cust = 1",
+        "SELECT oid FROM orders INNER JOIN customers ON 1 = cust_key",
+        "SELECT oid FROM orders INNER JOIN customers ON cust = cust_key AND oid = 1",
+        "SELECT oid FROM orders INNER JOIN customers ON cust = cust_key OR oid = 1",
+        "SELECT oid FROM orders INNER JOIN customers ON oid = amt",
+        "SELECT oid FROM orders INNER JOIN customers",
+        "SELECT oid FROM orders INNER customers ON cust = cust_key",
+        "SELECT oid FROM orders INNER JOIN ON cust = cust_key",
+        "SELECT oid FROM orders INNER JOIN customers ON",
+        # no aliases
+        "SELECT o.oid FROM orders o INNER JOIN customers c ON o.cust = c.cust_key",
+        # no aggregates / GROUP BY / HAVING
+        "SELECT count(*) FROM orders INNER JOIN customers ON cust = cust_key",
+        "SELECT oid, sum(amt) FROM orders INNER JOIN customers ON cust = cust_key",
+        "SELECT oid FROM orders INNER JOIN customers ON cust = cust_key GROUP BY oid",
+        "SELECT oid FROM orders INNER JOIN customers ON cust = cust_key HAVING count(*) > 0",
+        "SELECT oid FROM orders INNER JOIN customers ON cust = cust_key ORDER BY count(*)",
+        # ORDER BY must reference the SELECT list
+        "SELECT oid FROM orders INNER JOIN customers ON cust = cust_key ORDER BY name",
+        "SELECT oid FROM orders INNER JOIN customers ON cust = cust_key ORDER BY oid, oid",
+        # LIMIT still an integer
+        "SELECT oid FROM orders INNER JOIN customers ON cust = cust_key LIMIT 1.5",
+        # qualified columns are not valid in single-table queries
+        "SELECT orders.oid FROM orders",
+        "SELECT oid FROM orders WHERE orders.oid = 1",
+    ],
+)
+def test_bad_join_sql_raises_valueerror(join_dir, sql):
+    with pytest.raises(ValueError):
+        execute(str(join_dir), sql)
+
+
+def test_join_renders_exact_decimals(join_dir):
+    result = execute(
+        str(join_dir),
+        "SELECT orders.amt, orders.oid FROM orders INNER JOIN customers "
+        "ON orders.cust = customers.cust_key WHERE orders.oid = 11",
+    )
+    assert render(result) == (
+        '{"columns":["orders.amt","orders.oid"],"rows":[[50.5,11]],"row_count":1}'
+    )
+
+
+def test_join_cli(join_dir):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "olap_turbo",
+            "--data-dir",
+            str(join_dir),
+            "--query",
+            "SELECT orders.oid, customers.name FROM orders INNER JOIN customers "
+            "ON orders.cust = customers.cust_key ORDER BY orders.oid DESC LIMIT 2",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(proc.stdout)
+    assert payload == {
+        "columns": ["orders.oid", "customers.name"],
+        "rows": [[14, "gamma"], [13, "beta"]],
+        "row_count": 2,
+    }

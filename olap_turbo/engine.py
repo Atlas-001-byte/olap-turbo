@@ -31,6 +31,17 @@ of a batch, even on rows whose other OR branches already settle the
 outcome: OR never short-circuits cell validation, so a non-numeric cell
 anywhere a numeric predicate reaches fails the whole query.
 
+Join queries (exactly one INNER JOIN) take a separate, simpler path in
+:func:`_run_join`: both tables are read in full, the right table is
+hashed by its normalized ON key and each left row (in left CSV order)
+expands to all matching right rows in right CSV order. ON keys are
+finite decimals on *both* sides match by exact decimal value (``1``
+equals ``1.0``); every other pairing matches by raw text, so a number
+never joins to text. WHERE — the same AND/OR/parentheses predicate —
+runs only after the join has fully expanded, then projection, ORDER BY
+(stable, preserving join row order) and LIMIT apply exactly as for
+single-table projections.
+
 All arithmetic and numeric comparison go through :class:`decimal.Decimal`
 so results are deterministic and free of binary-float artifacts.
 """
@@ -46,6 +57,7 @@ from .sql import (
     Comparison,
     HavingComparison,
     HavingExpr,
+    JoinOn,
     Query,
     SelectItem,
     SortItem,
@@ -479,6 +491,275 @@ def _run_batches(
     }
 
 
+def _read_table(path: Path) -> Tuple[List[str], List[List[str]]]:
+    """Read a CSV table into its header and raw data rows (CSV order)."""
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh)
+        try:
+            header = next(reader)
+        except StopIteration:
+            header = []
+        rows = [list(row) for row in reader]
+    return header, rows
+
+
+def _join_key(field: str) -> Any:
+    """Normalize one ON cell.
+
+    Finite decimal text joins by exact decimal value (so ``1`` and ``1.0``
+    match); everything else joins by raw text. A normalized number never
+    equals a text key, so mixed numeric/text values never match.
+    """
+    try:
+        value = Decimal(field)
+    except (InvalidOperation, ValueError):
+        return field
+    if not value.is_finite():
+        return field
+    return value
+
+
+def _resolve_join_column(
+    table: Optional[str],
+    name: str,
+    left_table: str,
+    right_table: str,
+    left_header: Sequence[str],
+    right_header: Sequence[str],
+) -> Tuple[int, int]:
+    """Resolve a (possibly bare) reference to ``(side, column_index)``.
+
+    Side 0 is the left/FROM table, side 1 the JOIN table. A bare name present
+    in both headers is ambiguous (ValueError); a missing column is KeyError.
+    """
+    if table is not None and table not in (left_table, right_table):
+        raise ValueError(f"unknown table qualifier {table!r} for column {name!r}")
+    in_left = name in left_header
+    in_right = name in right_header
+    if table is None:
+        if in_left and in_right:
+            raise ValueError(
+                f"column {name!r} is ambiguous: it exists in both "
+                f"{left_table!r} and {right_table!r}; qualify it with the "
+                "table name"
+            )
+        if not in_left and not in_right:
+            raise KeyError(
+                f"column {name!r} does not exist in either {left_table!r} "
+                f"or {right_table!r}"
+            )
+        if in_left:
+            return 0, left_header.index(name)
+        return 1, right_header.index(name)
+    if table == left_table:
+        if not in_left:
+            raise KeyError(
+                f"column {name!r} does not exist in table {left_table!r}"
+            )
+        return 0, left_header.index(name)
+    if not in_right:
+        raise KeyError(
+            f"column {name!r} does not exist in table {right_table!r}"
+        )
+    return 1, right_header.index(name)
+
+
+def _resolve_on(
+    on: JoinOn,
+    left_table: str,
+    right_table: str,
+    left_header: Sequence[str],
+    right_header: Sequence[str],
+) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """Resolve the ON equality into one (side, index) pair per table.
+
+    The two sides must come from different tables, one each; a same-table
+    pair (after bare resolution) is a ValueError.
+    """
+    first = _resolve_join_column(
+        on.left.table, on.left.name,
+        left_table, right_table, left_header, right_header,
+    )
+    second = _resolve_join_column(
+        on.right.table, on.right.name,
+        left_table, right_table, left_header, right_header,
+    )
+    if first[0] == second[0]:
+        raise ValueError(
+            "ON must compare one column from each table, not two columns of "
+            "the same table"
+        )
+    if first[0] == 0:
+        return first, second
+    return second, first
+
+
+def _join_comparison_vector(
+    pairs: Sequence[Tuple[Sequence[str], Sequence[str]]],
+    position: Tuple[int, int],
+    comp: Comparison,
+) -> List[bool]:
+    """Evaluate one WHERE comparison over every joined row.
+
+    As with the single-table scan, the column is parsed for every joined row
+    up front: OR never short-circuits numeric cell validation.
+    """
+    side, idx = position
+    vec = [
+        pair[side][idx] if idx < len(pair[side]) else "" for pair in pairs
+    ]
+    result: List[bool] = [False] * len(vec)
+    if comp.quoted:
+        target_text = comp.value_text
+        for i, field in enumerate(vec):
+            result[i] = _compare(field, comp.op, target_text)
+    else:
+        target = Decimal(comp.value_text)
+        label = comp.column if comp.table is None else f"{comp.table}.{comp.column}"
+        for i, field in enumerate(vec):
+            result[i] = _compare(_decimal(field, label), comp.op, target)
+    return result
+
+
+def _resolve_where_positions(
+    node: WhereExpr,
+    positions: Dict[int, Tuple[int, int]],
+    left_table: str,
+    right_table: str,
+    left_header: Sequence[str],
+    right_header: Sequence[str],
+) -> None:
+    if isinstance(node, Comparison):
+        positions[id(node)] = _resolve_join_column(
+            node.table, node.column,
+            left_table, right_table, left_header, right_header,
+        )
+        return
+    for operand in node.operands:
+        _resolve_where_positions(
+            operand, positions,
+            left_table, right_table, left_header, right_header,
+        )
+
+
+def _eval_join_where(
+    node: WhereExpr,
+    pairs: Sequence[Tuple[Sequence[str], Sequence[str]]],
+    positions: Dict[int, Tuple[int, int]],
+) -> List[bool]:
+    """Vectorized boolean-tree evaluation on the joined rows."""
+    if isinstance(node, Comparison):
+        return _join_comparison_vector(pairs, positions[id(node)], node)
+    vectors = [
+        _eval_join_where(operand, pairs, positions) for operand in node.operands
+    ]
+    return _combine(node.op, vectors)
+
+
+def _run_join(data_dir: str, query: Query) -> Dict[str, Any]:
+    """Execute the single supported INNER JOIN query end to end."""
+    left_table = query.table
+    right_table = query.join_table
+    # Built-in open raises FileNotFoundError, preserving the required type;
+    # the left (FROM) table is opened before the right (JOIN) table.
+    left_path = Path(data_dir) / f"{left_table}.csv"
+    right_path = Path(data_dir) / f"{right_table}.csv"
+    left_header, left_rows = _read_table(left_path)
+    right_header, right_rows = _read_table(right_path)
+
+    def resolve(table: Optional[str], name: str) -> Tuple[int, int]:
+        return _resolve_join_column(
+            table, name, left_table, right_table, left_header, right_header
+        )
+
+    # ON first: it uniquely defines the cross-table column pair.
+    left_pos, right_pos = _resolve_on(
+        query.join_on, left_table, right_table, left_header, right_header
+    )
+
+    # Hash the right table by normalized join key; appending in CSV order
+    # keeps each bucket in right-table CSV order.
+    right_buckets: Dict[Any, List[Sequence[str]]] = {}
+    right_idx = right_pos[1]
+    for row in right_rows:
+        field = row[right_idx] if right_idx < len(row) else ""
+        right_buckets.setdefault(_join_key(field), []).append(row)
+
+    # SELECT projection positions, resolved up front so unknown/ambiguous
+    # columns fail before any row is emitted.
+    select_positions = [
+        resolve(item.table, item.column) for item in query.select
+    ]
+
+    where_positions: Dict[int, Tuple[int, int]] = {}
+    if query.where is not None:
+        _resolve_where_positions(
+            query.where, where_positions,
+            left_table, right_table, left_header, right_header,
+        )
+
+    pairs: List[Tuple[Sequence[str], Sequence[str]]] = []
+    left_idx = left_pos[1]
+    # Every left row is visited in left CSV order; each left row expands to
+    # all of its matching right rows in right CSV order.
+    for lrow in left_rows:
+        field = lrow[left_idx] if left_idx < len(lrow) else ""
+        for rrow in right_buckets.get(_join_key(field), ()):  # inner join
+            pairs.append((lrow, rrow))
+
+    # WHERE runs only after the join has fully expanded the rows.
+    if query.where is not None:
+        mask = _eval_join_where(query.where, pairs, where_positions)
+        pairs = [pair for pair, matched in zip(pairs, mask) if matched]
+
+    projected_rows = []
+    for pair in pairs:
+        projected_rows.append(
+            [
+                _project_value(pair[side][idx] if idx < len(pair[side]) else "")
+                for side, idx in select_positions
+            ]
+        )
+
+    result: Dict[str, Any] = {
+        "columns": [item.text for item in query.select],
+        "rows": projected_rows,
+        "row_count": len(projected_rows),
+    }
+
+    # ORDER BY sorts the fully joined/filtered/projected rows; stability
+    # keeps join row order (left CSV order, then right CSV order). LIMIT
+    # truncates last.
+    if query.order_by:
+        # Resolve each sort item through the two headers (so bare and
+        # qualified references to the same column are identical) and map it
+        # to its position in the SELECT list.
+        order_positions = []
+        seen: set = set()
+        for sort_item in query.order_by:
+            position = resolve(sort_item.table, sort_item.column)
+            if position in seen:
+                raise ValueError(
+                    f"duplicate ORDER BY item {sort_item.text!r}"
+                )
+            seen.add(position)
+            try:
+                idx = select_positions.index(position)
+            except ValueError:
+                raise ValueError(
+                    f"ORDER BY column {sort_item.text!r} is not in the "
+                    "SELECT list"
+                )
+            order_positions.append((idx, sort_item.descending))
+        for idx, descending in reversed(order_positions):
+            result["rows"].sort(
+                key=lambda row, i=idx: _sort_key(row[i]), reverse=descending
+            )
+    if query.limit is not None:
+        _apply_limit(result, query.limit)
+    return result
+
+
 def _dumps(obj: Any) -> str:
     """Deterministic JSON encoder; Decimal values render as decimal numbers."""
 
@@ -541,6 +822,8 @@ def execute(data_dir: str, sql: str) -> Dict[str, Any]:
             cannot be read as a decimal number.
     """
     query: Query = parse_sql(sql)
+    if query.is_join:
+        return _run_join(data_dir, query)
     table_path = Path(data_dir) / f"{query.table}.csv"
     # Built-in open raises FileNotFoundError, preserving the required type.
     with open(table_path, "r", encoding="utf-8", newline="") as fh:
