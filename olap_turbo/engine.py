@@ -26,6 +26,19 @@ right; rows equal on every key keep their incoming order (CSV row order
 for projections, first-appearance order for groups). LIMIT, when present,
 truncates the sorted rows last.
 
+A query may instead join exactly two tables with one
+``INNER JOIN ... ON left_ref = right_ref`` clause (plain column projection
+only: no aggregates, GROUP BY or HAVING). The right table is hashed once
+on its join key; each left row then probes the hash and expands to every
+matching right row, so joined rows emerge in left-table CSV order with
+each left row's matches in right-table CSV order. Join keys follow the
+grouping-key normalization: two finite-decimal keys compare by exact
+numeric value (``1`` matches ``1.0``), everything else compares by raw
+text, and a numeric key never matches a text key. WHERE runs on the
+joined rows, after the join; SELECT, ON, WHERE and ORDER BY references
+may be table-qualified, and an unqualified column must exist in exactly
+one of the two tables.
+
 Every cell read by a numeric comparison is parsed eagerly for every row
 of a batch, even on rows whose other OR branches already settle the
 outcome: OR never short-circuits cell validation, so a non-numeric cell
@@ -51,6 +64,7 @@ from .sql import (
     SortItem,
     WhereExpr,
     parse_sql,
+    ref_matches,
 )
 
 BATCH_SIZE = 1024
@@ -111,7 +125,7 @@ def _comparison_vector(
     other OR branches already decide the row: OR does not short-circuit
     cell validation.
     """
-    idx = col_index[comp.column]
+    idx = col_index[comp.ref]
     vec = _column_vector(rows, idx)
     result: List[bool] = [False] * len(vec)
     if comp.quoted:
@@ -121,7 +135,7 @@ def _comparison_vector(
     else:
         target = Decimal(comp.value_text)
         for i, field in enumerate(vec):
-            result[i] = _compare(_decimal(field, comp.column), comp.op, target)
+            result[i] = _compare(_decimal(field, comp.ref), comp.op, target)
     return result
 
 
@@ -249,7 +263,7 @@ def _accumulate(
 ) -> None:
     """Roll one matched row into the aggregate state."""
     for item in agg_items:
-        idx = col_index[item.column]
+        idx = col_index[item.ref]
         field = row[idx] if idx < len(row) else ""
         value = _decimal(field, item.column)
         key = (item.kind, item.column)
@@ -360,7 +374,7 @@ def _apply_order_by(
         idx = next(
             pos
             for pos, si in enumerate(select)
-            if si.kind == item.kind and si.column == item.column
+            if ref_matches(item, si)
         )
         rows.sort(key=lambda row, i=idx: _sort_key(row[i]), reverse=item.descending)
 
@@ -376,7 +390,11 @@ def _run_batches(
     query: Query,
     header: Sequence[str],
 ) -> Dict[str, Any]:
-    col_index = {name: header.index(name) for name in query.required_columns()}
+    # Keyed by reference text ("t.a" when qualified, "a" otherwise).
+    col_index: Dict[str, int] = {}
+    for qualifier, name in query.required_refs():
+        key = f"{qualifier}.{name}" if qualifier else name
+        col_index[key] = header.index(name)
 
     projected_rows: List[List[Any]] = []
     count = 0
@@ -390,7 +408,7 @@ def _run_batches(
         order: List[Tuple[Any, ...]] = []
         group_counts: Dict[Tuple[Any, ...], int] = {}
         group_states: Dict[Tuple[Any, ...], Dict[_AggKey, Optional[Decimal]]] = {}
-        group_idxs = [col_index[name] for name in query.group_by]
+        group_idxs = [header.index(name) for name in query.group_by]
 
         while True:
             batch = [row for _, row in zip(range(BATCH_SIZE), reader)]
@@ -449,7 +467,7 @@ def _run_batches(
                 count += 1
                 _accumulate(state, agg_items, batch[i], col_index)
         else:
-            indices = [col_index[item.column] for item in select_cols]
+            indices = [col_index[item.ref] for item in select_cols]
             for i, matched in enumerate(mask):
                 if not matched:
                     continue
@@ -531,16 +549,156 @@ def _json_string(text: str) -> str:
     return "".join(out)
 
 
-def execute(data_dir: str, sql: str) -> Dict[str, Any]:
-    """Run *sql* against CSV tables in *data_dir*; return a result dict.
+def _where_comparisons(node: WhereExpr):
+    """Yield every leaf comparison of a WHERE boolean tree."""
+    if isinstance(node, Comparison):
+        yield node
+        return
+    for operand in node.operands:
+        yield from _where_comparisons(operand)
 
-    Raises:
-        FileNotFoundError: the table's CSV file does not exist.
-        KeyError: the query references a column absent from the header.
-        ValueError: the SQL is malformed/unsupported, or a required field
-            cannot be read as a decimal number.
+
+def _execute_join(data_dir: str, query: Query) -> Dict[str, Any]:
+    """Run a single INNER JOIN query.
+
+    The right table is hashed once on its join key (CSV row order kept per
+    key); the left table is then scanned in batches and each left row
+    expands to every matching right row in right-table CSV order. WHERE
+    filters the joined rows, projection reads only the referenced columns.
     """
-    query: Query = parse_sql(sql)
+    left_name = query.table
+    right_name = query.right_table
+    left_path = Path(data_dir) / f"{left_name}.csv"
+    right_path = Path(data_dir) / f"{right_name}.csv"
+    # Built-in open raises FileNotFoundError, preserving the required type.
+    with open(left_path, "r", encoding="utf-8", newline="") as left_fh, open(
+        right_path, "r", encoding="utf-8", newline=""
+    ) as right_fh:
+        left_reader = csv.reader(left_fh)
+        right_reader = csv.reader(right_fh)
+        try:
+            left_header = next(left_reader)
+        except StopIteration:
+            left_header = []
+        try:
+            right_header = next(right_reader)
+        except StopIteration:
+            right_header = []
+
+        def resolve(qualifier: Optional[str], column: str) -> Tuple[str, int]:
+            """Resolve a column reference to ("L" | "R", header index)."""
+            if qualifier is not None:
+                if qualifier == left_name and column in left_header:
+                    return ("L", left_header.index(column))
+                if qualifier == right_name and column in right_header:
+                    return ("R", right_header.index(column))
+                raise KeyError(
+                    f"column {qualifier}.{column} does not exist in table "
+                    f"{qualifier!r}"
+                )
+            in_left = column in left_header
+            in_right = column in right_header
+            if in_left and in_right:
+                raise ValueError(
+                    f"column {column!r} is ambiguous: it exists in both "
+                    f"{left_name!r} and {right_name!r}"
+                )
+            if in_left:
+                return ("L", left_header.index(column))
+            if in_right:
+                return ("R", right_header.index(column))
+            raise KeyError(
+                f"column {column!r} does not exist in table {left_name!r} "
+                f"or {right_name!r}"
+            )
+
+        # The ON pair must be one column from each table, in either order.
+        on_first, on_second = query.join_on
+        side_a = resolve(on_first.qualifier, on_first.column)
+        side_b = resolve(on_second.qualifier, on_second.column)
+        if side_a[0] == side_b[0]:
+            raise ValueError(
+                "ON must compare one column from each of the two tables"
+            )
+        left_key_idx = side_a[1] if side_a[0] == "L" else side_b[1]
+        right_key_idx = side_b[1] if side_b[0] == "R" else side_a[1]
+
+        # Columns the joined row stream must carry: SELECT and WHERE
+        # references, deduplicated in first-appearance order.
+        needed: List[Tuple[Optional[str], str]] = []
+        seen = set()
+        for item in query.select:
+            key = (item.qualifier, item.column)
+            if key not in seen:
+                seen.add(key)
+                needed.append(key)
+        if query.where is not None:
+            for comp in _where_comparisons(query.where):
+                key = (comp.qualifier, comp.column)
+                if key not in seen:
+                    seen.add(key)
+                    needed.append(key)
+        resolved = [resolve(qualifier, column) for qualifier, column in needed]
+        ref_keys = [f"{q}.{c}" if q else c for q, c in needed]
+        col_index = {key: pos for pos, key in enumerate(ref_keys)}
+        # ORDER BY references resolve against the same two tables; an
+        # unqualified one must not be ambiguous either.
+        for sort_item in query.order_by:
+            resolve(sort_item.qualifier, sort_item.column)
+
+        # Build side: hash the right table's join keys, keeping the right
+        # rows of each key in CSV row order.
+        right_rows: List[List[str]] = []
+        right_keys: Dict[Any, List[int]] = {}
+        for row in right_reader:
+            cell = row[right_key_idx] if right_key_idx < len(row) else ""
+            right_keys.setdefault(_group_key(cell), []).append(len(right_rows))
+            right_rows.append(row)
+
+        select_positions = [col_index[item.ref] for item in query.select]
+
+        projected_rows: List[List[Any]] = []
+        while True:
+            batch = [row for _, row in zip(range(BATCH_SIZE), left_reader)]
+            if not batch:
+                break
+            # Probe side: each left row joins every matching right row in
+            # right-table CSV order; left rows expand in left CSV order.
+            joined: List[List[str]] = []
+            for row in batch:
+                cell = row[left_key_idx] if left_key_idx < len(row) else ""
+                for right_idx in right_keys.get(_group_key(cell), ()):
+                    right_row = right_rows[right_idx]
+                    joined.append(
+                        [
+                            (row[idx] if idx < len(row) else "")
+                            if side == "L"
+                            else (right_row[idx] if idx < len(right_row) else "")
+                            for side, idx in resolved
+                        ]
+                    )
+            if not joined:
+                continue
+            mask = (
+                [True] * len(joined)
+                if query.where is None
+                else _evaluate_predicate(joined, col_index, query.where)
+            )
+            for i, matched in enumerate(mask):
+                if not matched:
+                    continue
+                compact = joined[i]
+                projected_rows.append(
+                    [_project_value(compact[pos]) for pos in select_positions]
+                )
+        return {
+            "columns": [item.text for item in query.select],
+            "rows": projected_rows,
+            "row_count": len(projected_rows),
+        }
+
+
+def _execute_single(data_dir: str, query: Query) -> Dict[str, Any]:
     table_path = Path(data_dir) / f"{query.table}.csv"
     # Built-in open raises FileNotFoundError, preserving the required type.
     with open(table_path, "r", encoding="utf-8", newline="") as fh:
@@ -554,13 +712,37 @@ def execute(data_dir: str, sql: str) -> Dict[str, Any]:
                 raise KeyError(
                     f"column {name!r} does not exist in table {query.table!r}"
                 )
-        result = _run_batches(reader, query, header)
-        # ORDER BY sorts the fully computed result rows; LIMIT truncates last.
-        if query.order_by:
-            _apply_order_by(result, query.order_by, query.select)
-        if query.limit is not None:
-            _apply_limit(result, query.limit)
-        return result
+        for qualifier, column in query.column_refs():
+            if qualifier is not None and qualifier != query.table:
+                raise KeyError(
+                    f"column {qualifier}.{column} does not exist in table "
+                    f"{query.table!r}"
+                )
+        return _run_batches(reader, query, header)
+
+
+def execute(data_dir: str, sql: str) -> Dict[str, Any]:
+    """Run *sql* against CSV tables in *data_dir*; return a result dict.
+
+    Raises:
+        FileNotFoundError: a table's CSV file does not exist.
+        KeyError: the query references a column absent from the header(s).
+        ValueError: the SQL is malformed/unsupported (including JOIN forms
+            beyond a single INNER JOIN with a plain projection), an
+            unqualified column is ambiguous between the two joined tables,
+            or a required field cannot be read as a decimal number.
+    """
+    query: Query = parse_sql(sql)
+    if query.is_join:
+        result = _execute_join(data_dir, query)
+    else:
+        result = _execute_single(data_dir, query)
+    # ORDER BY sorts the fully computed result rows; LIMIT truncates last.
+    if query.order_by:
+        _apply_order_by(result, query.order_by, query.select)
+    if query.limit is not None:
+        _apply_limit(result, query.limit)
+    return result
 
 
 def render(result: Dict[str, Any]) -> str:

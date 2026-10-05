@@ -2,11 +2,13 @@
 
 Supported grammar (the complete surface for this baseline)::
 
-    query      := SELECT select_list FROM identifier
+    query      := SELECT select_list FROM identifier [ join ]
                   [ WHERE boolean ] [ GROUP BY identifier (, identifier)* ]
                   [ HAVING having_boolean ]
                   [ ORDER BY sort_item (, sort_item)* ] [ LIMIT integer ]
-    sort_item  := (identifier | count_star | agg_expr) [ ASC | DESC ]
+    join       := INNER JOIN identifier ON column_ref = column_ref
+    column_ref := identifier [ . identifier ]
+    sort_item  := (column_ref | count_star | agg_expr) [ ASC | DESC ]
     agg_expr   := sum_expr | avg_expr | min_expr | max_expr
     select_list:= grouping_column (, grouping_column)*,
                   count_star, agg_expr (, agg_expr)*   (grouped aggregate query)
@@ -59,6 +61,16 @@ aggregate expressions (``sum``/``avg``/``min``/``max`` over a column).
 Every aggregate expression — the function name plus its column — may appear
 at most once in a SELECT list, in grouped and ungrouped queries alike.
 
+A query may join exactly two tables with a single ``INNER JOIN ... ON``
+clause naming the left and right table (which must be distinct); the ON
+condition is exactly one equality between two column references, one
+resolving to each table. SELECT, ON, WHERE and ORDER BY column references
+may be qualified with a table name (``table.column``); an unqualified
+column is only valid when the name exists in exactly one of the two
+tables. Join queries support plain column projection only: no aliases, no
+LEFT/other join types, no multiple joins, no GROUP BY, no HAVING and no
+aggregate SELECT items — any of those raises :class:`ValueError`.
+
 Anything else (missing FROM, NOT, functions other than
 count(*)/sum()/avg()/min()/max() in SELECT, wildcards, extra clauses,
 malformed syntax, unmatched parentheses, OR outside WHERE/HAVING) raises
@@ -79,6 +91,7 @@ class _TokKind(Enum):
     STRING = "string"
     OP = "op"
     COMMA = "comma"
+    DOT = "dot"
     STAR = "star"
     LPAREN = "lparen"
     RPAREN = "rparen"
@@ -87,7 +100,7 @@ class _TokKind(Enum):
 
 _KEYWORDS = {
     "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "GROUP", "BY", "HAVING",
-    "ORDER", "LIMIT",
+    "ORDER", "LIMIT", "INNER", "JOIN", "ON",
 }
 
 
@@ -107,6 +120,10 @@ def _tokenize(sql: str) -> List[_Token]:
             continue
         if c == ",":
             tokens.append(_Token(_TokKind.COMMA, c))
+            i += 1
+            continue
+        if c == ".":
+            tokens.append(_Token(_TokKind.DOT, c))
             i += 1
             continue
         if c == "(":
@@ -182,12 +199,30 @@ def _parse_decimal(text: str):
 
 
 @dataclass(frozen=True)
+class ColumnRef:
+    """A column reference, optionally qualified with a table name."""
+
+    qualifier: Optional[str]
+    column: str
+
+    @property
+    def text(self) -> str:
+        return f"{self.qualifier}.{self.column}" if self.qualifier else self.column
+
+
+@dataclass(frozen=True)
 class Comparison:
     column: str
     op: str
     # value_text is the raw literal; quoted distinguishes text vs numeric.
     value_text: str
     quoted: bool
+    qualifier: Optional[str] = None
+
+    @property
+    def ref(self) -> str:
+        """Reference text as written, e.g. ``t.a`` or ``a``."""
+        return f"{self.qualifier}.{self.column}" if self.qualifier else self.column
 
 
 @dataclass(frozen=True)
@@ -230,24 +265,50 @@ BooleanNode = Union[Comparison, HavingComparison, BoolOp]
 @dataclass(frozen=True)
 class SelectItem:
     # Original expression text as written in the query, e.g. "count(*)",
-    # "sum(a)", "avg(a)".
+    # "sum(a)", "avg(a)", "t.a".
     text: str
     kind: str  # "column" | "count_star" | "sum" | "avg" | "min" | "max"
     column: Optional[str] = None
+    qualifier: Optional[str] = None
+
+    @property
+    def ref(self) -> str:
+        """Reference text as written, e.g. ``t.a`` or ``a``."""
+        return f"{self.qualifier}.{self.column}" if self.qualifier else self.column
 
 
 @dataclass(frozen=True)
 class SortItem:
     """One ORDER BY item: a result-column reference with a direction.
 
-    ``text`` is the normalized expression text (``a``, ``count(*)``,
-    ``sum(a)``, ``avg(a)``); ``kind``/``column`` mirror :class:`SelectItem`.
+    ``text`` is the normalized expression text (``a``, ``t.a``,
+    ``count(*)``, ``sum(a)``, ``avg(a)``); ``kind``/``column`` mirror
+    :class:`SelectItem`.
     """
 
     text: str
     kind: str  # "column" | "count_star" | "sum" | "avg" | "min" | "max"
     column: Optional[str] = None
     descending: bool = False
+    qualifier: Optional[str] = None
+
+
+def ref_matches(sort_item: SortItem, select_item: SelectItem) -> bool:
+    """Whether an ORDER BY item can reference a SELECT result column.
+
+    Kind and column name must agree; a qualifier present on both sides
+    must match exactly, while an unqualified side matches any qualifier
+    (ambiguity between several qualified matches is rejected separately).
+    """
+    if sort_item.kind != select_item.kind:
+        return False
+    if sort_item.column != select_item.column:
+        return False
+    return (
+        sort_item.qualifier is None
+        or select_item.qualifier is None
+        or sort_item.qualifier == select_item.qualifier
+    )
 
 
 @dataclass(frozen=True)
@@ -259,6 +320,9 @@ class Query:
     having: Optional[HavingExpr] = None
     order_by: Tuple[SortItem, ...] = ()
     limit: Optional[int] = None
+    # A single INNER JOIN: the right table name and the ON equality pair.
+    right_table: Optional[str] = None
+    join_on: Optional[Tuple[ColumnRef, ColumnRef]] = None
 
     @property
     def is_aggregate(self) -> bool:
@@ -268,33 +332,55 @@ class Query:
     def is_grouped(self) -> bool:
         return bool(self.group_by)
 
+    @property
+    def is_join(self) -> bool:
+        return self.right_table is not None
+
     def required_columns(self) -> Tuple[str, ...]:
         """Columns the scan must materialize (group key, aggregates, predicates)."""
         cols: List[str] = []
         seen = set()
-        for item in self.select:
-            if item.kind == "column":
-                if item.column not in seen:
-                    seen.add(item.column)
-                    cols.append(item.column)
-            elif item.kind in _AGG_KINDS and item.column not in seen:
-                seen.add(item.column)
-                cols.append(item.column)
-        if self.where is not None:
-            self._collect_where_columns(self.where, cols, seen)
+        for _qualifier, name in self.required_refs():
+            if name not in seen:
+                seen.add(name)
+                cols.append(name)
         return tuple(cols)
 
+    def required_refs(self) -> Tuple[Tuple[Optional[str], str], ...]:
+        """(qualifier, column) pairs the scan must materialize, deduplicated."""
+        refs: List[Tuple[Optional[str], str]] = []
+        seen = set()
+        for item in self.select:
+            if item.kind == "column" or item.kind in _AGG_KINDS:
+                key = (item.qualifier, item.column)
+                if key not in seen:
+                    seen.add(key)
+                    refs.append(key)
+        if self.where is not None:
+            self._collect_where_refs(self.where, refs, seen)
+        return tuple(refs)
+
+    def column_refs(self) -> Tuple[Tuple[Optional[str], str], ...]:
+        """Every (qualifier, column) pair named by SELECT, ON or WHERE."""
+        refs = list(self.required_refs())
+        if self.join_on is not None:
+            refs.extend((ref.qualifier, ref.column) for ref in self.join_on)
+        return tuple(refs)
+
     @staticmethod
-    def _collect_where_columns(
-        node: WhereExpr, cols: List[str], seen: set
+    def _collect_where_refs(
+        node: WhereExpr,
+        refs: List[Tuple[Optional[str], str]],
+        seen: set,
     ) -> None:
         if isinstance(node, Comparison):
-            if node.column not in seen:
-                seen.add(node.column)
-                cols.append(node.column)
+            key = (node.qualifier, node.column)
+            if key not in seen:
+                seen.add(key)
+                refs.append(key)
             return
         for operand in node.operands:
-            Query._collect_where_columns(operand, cols, seen)
+            Query._collect_where_refs(operand, refs, seen)
 
 
 _OPS = {"=", "!=", ">", ">=", "<", "<="}
@@ -335,6 +421,10 @@ class _Parser:
         table_tok = self._next()
         if table_tok.kind is not _TokKind.IDENT:
             raise ValueError("table name must be a simple identifier")
+        right_table: Optional[str] = None
+        join_on: Optional[Tuple[ColumnRef, ColumnRef]] = None
+        if self._accept_keyword("INNER"):
+            right_table, join_on = self._parse_join(table_tok.text, items)
         where: Optional[WhereExpr] = None
         having: Optional[HavingExpr] = None
         group_by: List[str] = []
@@ -346,6 +436,8 @@ class _Parser:
             where = self._parse_or()
             tok = self._peek()
         if tok.kind is _TokKind.KEYWORD and tok.text == "GROUP":
+            if right_table is not None:
+                raise ValueError("GROUP BY is not supported on JOIN queries")
             self._next()
             self._expect_keyword("BY")
             group_by = [self._expect(_TokKind.IDENT).text]
@@ -357,6 +449,8 @@ class _Parser:
         else:
             self._validate_ungrouped(items)
         if tok.kind is _TokKind.KEYWORD and tok.text == "HAVING":
+            if right_table is not None:
+                raise ValueError("HAVING is not supported on JOIN queries")
             self._next()
             having = self._parse_having_or()
             if not (bool(group_by) or items[0].kind == "count_star"):
@@ -396,7 +490,46 @@ class _Parser:
             having,
             tuple(order_by),
             limit,
+            right_table,
+            join_on,
         )
+
+    def _parse_join(
+        self, left_table: str, items: List[SelectItem]
+    ) -> Tuple[str, Tuple[ColumnRef, ColumnRef]]:
+        """Parse ``INNER JOIN <table> ON <ref> = <ref>`` (INNER consumed).
+
+        Exactly one INNER JOIN between two distinct tables; the ON clause
+        is a single equality between two column references. Join queries
+        project plain columns only (no aggregates).
+        """
+        self._expect_keyword("JOIN")
+        right_tok = self._next()
+        if right_tok.kind is not _TokKind.IDENT:
+            raise ValueError("table name must be a simple identifier")
+        if right_tok.text == left_table:
+            raise ValueError("INNER JOIN requires two distinct tables")
+        self._expect_keyword("ON")
+        left_ref = self._parse_column_ref()
+        op_tok = self._expect(_TokKind.OP)
+        if op_tok.text != "=":
+            raise ValueError("ON must be a single '=' between two columns")
+        right_ref = self._parse_column_ref()
+        for item in items:
+            if item.kind != "column":
+                raise ValueError(
+                    "JOIN queries support plain column projection only"
+                )
+        return right_tok.text, (left_ref, right_ref)
+
+    def _parse_column_ref(self) -> ColumnRef:
+        """Parse ``identifier`` or ``identifier.identifier``."""
+        tok = self._expect(_TokKind.IDENT)
+        if self._peek().kind is _TokKind.DOT:
+            self._next()
+            name = self._expect(_TokKind.IDENT)
+            return ColumnRef(tok.text, name.text)
+        return ColumnRef(None, tok.text)
 
     def _validate_grouped(
         self, items: List[SelectItem], group_by: List[str]
@@ -497,8 +630,8 @@ class _Parser:
         if tok.kind is _TokKind.STAR:
             raise ValueError("wildcard column '*' is not supported")
         if tok.kind is _TokKind.IDENT:
-            self._next()
-            return SelectItem(tok.text, "column", tok.text)
+            ref = self._parse_column_ref()
+            return SelectItem(ref.text, "column", ref.column, ref.qualifier)
         raise ValueError(f"invalid SELECT item {tok.text!r}")
 
     def _expect(self, kind: _TokKind) -> _Token:
@@ -546,15 +679,15 @@ class _Parser:
         raise ValueError(f"expected a boolean condition but found {tok.text!r}")
 
     def _parse_comparison(self) -> Comparison:
-        col = self._expect(_TokKind.IDENT)
+        ref = self._parse_column_ref()
         op_tok = self._expect(_TokKind.OP)
         if op_tok.text not in _OPS:
             raise ValueError(f"unsupported operator {op_tok.text!r}")
         val = self._next()
         if val.kind is _TokKind.NUMBER:
-            return Comparison(col.text, op_tok.text, val.text, False)
+            return Comparison(ref.column, op_tok.text, val.text, False, ref.qualifier)
         if val.kind is _TokKind.STRING:
-            return Comparison(col.text, op_tok.text, val.text, True)
+            return Comparison(ref.column, op_tok.text, val.text, True, ref.qualifier)
         raise ValueError(
             "comparison value must be an unquoted number or a double-quoted string"
         )
@@ -651,6 +784,7 @@ class _Parser:
 
     def _parse_sort_item(self, items: List[SelectItem]) -> SortItem:
         tok = self._peek()
+        qualifier: Optional[str] = None
         if (
             tok.kind is _TokKind.IDENT
             and self.tokens[self.pos + 1].kind is _TokKind.LPAREN
@@ -671,8 +805,13 @@ class _Parser:
                     "or sum/avg/min/max aggregates"
                 )
         elif tok.kind is _TokKind.IDENT:
-            self._next()
-            text, kind, column = tok.text, "column", tok.text
+            ref = self._parse_column_ref()
+            text, kind, column, qualifier = (
+                ref.text,
+                "column",
+                ref.column,
+                ref.qualifier,
+            )
         else:
             # Numbers, strings, keywords, '*', parens, EOF: none can start
             # a sort item.
@@ -684,7 +823,7 @@ class _Parser:
         if nxt.kind is _TokKind.IDENT and nxt.text.upper() in ("ASC", "DESC"):
             self._next()
             descending = nxt.text.upper() == "DESC"
-        sort_item = SortItem(text, kind, column, descending)
+        sort_item = SortItem(text, kind, column, descending, qualifier)
         self._validate_sort_item(sort_item, items)
         return sort_item
 
@@ -692,16 +831,19 @@ class _Parser:
         self, sort_item: SortItem, items: List[SelectItem]
     ) -> None:
         """Every ORDER BY item must reference a column of the result."""
-        for item in items:
-            if item.kind == sort_item.kind and item.column == sort_item.column:
-                return
-        if sort_item.kind == "column":
+        matches = [item for item in items if ref_matches(sort_item, item)]
+        if not matches:
+            if sort_item.kind == "column":
+                raise ValueError(
+                    f"ORDER BY column {sort_item.text!r} is not in the SELECT list"
+                )
             raise ValueError(
-                f"ORDER BY column {sort_item.text!r} is not in the SELECT list"
+                f"ORDER BY aggregate {sort_item.text} is not in the SELECT list"
             )
-        raise ValueError(
-            f"ORDER BY aggregate {sort_item.text} is not in the SELECT list"
-        )
+        if sort_item.qualifier is None and len({item.qualifier for item in matches}) > 1:
+            raise ValueError(
+                f"ORDER BY column {sort_item.text!r} is ambiguous"
+            )
 
     def _parse_limit(self) -> int:
         tok = self._next()

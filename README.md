@@ -8,7 +8,7 @@
 
 ## 状态
 
-首个可查询基线：CSV 表上的 SELECT/WHERE，支持列裁剪、谓词先于投影的批处理向量化执行，单列与多列 GROUP BY 分组聚合（`count(*)`、`sum`、`avg`、`min`、`max`），WHERE 中以 AND、OR 与嵌套圆括号组合的布尔条件，聚合结果上的 HAVING 分组后过滤，以及结果集上的 ORDER BY 排序与 LIMIT 截断。
+首个可查询基线：CSV 表上的 SELECT/WHERE，支持列裁剪、谓词先于投影的批处理向量化执行，单列与多列 GROUP BY 分组聚合（`count(*)`、`sum`、`avg`、`min`、`max`），WHERE 中以 AND、OR 与嵌套圆括号组合的布尔条件，聚合结果上的 HAVING 分组后过滤，两表一次 INNER JOIN 关联，以及结果集上的 ORDER BY 排序与 LIMIT 截断。
 
 ## 用法
 
@@ -18,6 +18,7 @@ python -m olap_turbo --data-dir <目录> --query <SQL>
 
 - 表为 `<目录>/<表名>.csv`，表名为去掉 `.csv` 的文件名；首行为列名，后续每行为记录。
 - 普通查询：`SELECT 列 [, 列 ...] FROM 表 [WHERE 条件]`，输出 `columns`、`rows`、`row_count`。
+- 关联查询：`SELECT 选择项 [, 选择项 ...] FROM 左表 INNER JOIN 右表 ON 左列 = 右列 [WHERE 条件] [ORDER BY 排序项 ...] [LIMIT n]`，恰好一次 INNER JOIN 连接两张表（左表.csv 与右表.csv）。SELECT、ON、WHERE、ORDER BY 中的列可写 `表名.列` 限定；无前缀列仅当它在两表中唯一时可用，两表重名的无前缀列抛出 `ValueError`。ON 必须恰好是一对分别来自左右两表的列相等（不能比较字面量、不能引用同表两列、不能组合多个条件），左右两表同名抛出 `ValueError`。连接键两边都是有限十进制数时按精确数值相等匹配（`1` 与 `1.0` 相配），其他值按原文精确比较，数值与文本混用不匹配。每个左行按右表 CSV 行序连接全部匹配右行，多个左行按左表 CSV 行序展开，连接完成后才执行 WHERE，随后照常投影、ORDER BY 排序、LIMIT 截断；`columns` 按 SELECT 顺序保留选择项原文（含表名限定）。关联查询不支持别名、LEFT/其他连接类型、多段 JOIN、GROUP BY、HAVING 或聚合 SELECT，出现即抛出 `ValueError`。
 - 聚合查询：`SELECT count(*) [, 聚合 ...] FROM 表 [WHERE 条件] [HAVING 聚合条件]`，聚合为 `sum(列)`、`avg(列)`、`min(列)`、`max(列)`，每个聚合表达式至多出现一次；`columns` 为原始表达式文本，通过 HAVING 时 `rows` 为单行、`row_count` 恒为 1，未通过时 `rows` 为 `[]`、`row_count` 为 0。无过滤行时 `count(*)` 为 0、`sum` 为数值 0、`avg`/`min`/`max` 为 JSON `null`。
 - 分组聚合：`SELECT 分组列1, 分组列2, ..., count(*) [, 聚合 ...] FROM 表 [WHERE 条件] GROUP BY 分组列1, 分组列2, ... [HAVING 聚合条件]`（一个或多个互不相同的分组列；单列分组为其特例）。SELECT 必须按 GROUP BY 的相同顺序开头列出全部分组列，其后为 `count(*)` 与一个或多个互不重复的聚合表达式（`sum`/`avg`/`min`/`max`，同一列可参与不同函数）。WHERE 先过滤再分组；每组一行，依次为各分组键、`count(*)` 与各聚合值，`row_count` 为分组数；分组按组合键在过滤后行序中首次出现的先后输出，空表或无匹配时 `rows` 为 `[]`、`row_count` 为 0。
 - HAVING 为聚合结果上的分组后过滤：全局聚合查询可写作 `SELECT count(*) [, 聚合 ...] FROM 表 [WHERE 条件] HAVING 聚合条件`，分组聚合查询将其固定置于 GROUP BY 之后；HAVING 至多出现一次，普通投影查询出现 HAVING 抛出 `ValueError`。执行顺序为 WHERE 先过滤，再形成全局聚合或组合键分组并精确求值，最后逐个判断 HAVING：全局聚合通过时仍输出原来的单行，未通过时 `rows` 为 `[]`、`row_count` 为 0；分组查询只保留通过的组，输出先后、`columns` 与每行字段顺序不变。
@@ -29,7 +30,7 @@ python -m olap_turbo --data-dir <目录> --query <SQL>
 - 组合键的每个位置按该单元格值归并：可读成有限十进制数的值按十进制精确比较（故 `1` 与 `1.0` 在对应位置同组），其他值按原文比较并输出 JSON 字符串；各位置独立判断，文本不被强制转成数值。
 - 结果以 CSV 原始行序、按 SELECT 列序输出为单个 JSON 对象。扫描只读取分组列、聚合列与条件列，未引用列不影响结果。
 
-不支持的写法（NOT、括号包裹列/值/非布尔表达式、括号不配对、条件不完整或连续运算符、OR 出现在 WHERE/HAVING 之外、其他函数、通配符列、GROUP BY/HAVING/ORDER BY/LIMIT 之外的子句、子句乱序或子句重复、普通投影查询带 HAVING、HAVING 引用未选中的聚合或普通列/分组列、HAVING 右值为字符串或其他表达式、ORDER BY 引用未选中的列或聚合、重复排序项、LIMIT 缺值或非非负整数、SELECT 漏列或乱序列出分组列、分组列重复或被夹入聚合项、GROUP BY 重复列、缺少 `count(*)` 或聚合项、重复聚合、缺少 FROM 等）抛出 `ValueError`；表文件不存在抛出 `FileNotFoundError`；引用不存在的列抛出 `KeyError`；WHERE 数值比较读取的任何单元格（不随 OR 分支短路）或已匹配行的聚合目标列含无法按有限十进制数读取的字段时抛出 `ValueError`（文本不会被静默转成数字）。查询不会在数据目录中创建或修改文件。
+不支持的写法（NOT、括号包裹列/值/非布尔表达式、括号不配对、条件不完整或连续运算符、OR 出现在 WHERE/HAVING 之外、其他函数、通配符列、GROUP BY/HAVING/ORDER BY/LIMIT 之外的子句、子句乱序或子句重复、普通投影查询带 HAVING、HAVING 引用未选中的聚合或普通列/分组列、HAVING 右值为字符串或其他表达式、ORDER BY 引用未选中的列或聚合、重复排序项、LIMIT 缺值或非非负整数、SELECT 漏列或乱序列出分组列、分组列重复或被夹入聚合项、GROUP BY 重复列、缺少 `count(*)` 或聚合项、重复聚合、缺少 FROM、表别名、LEFT/RIGHT/CROSS 等连接、多段 JOIN、ON 非唯一跨表列相等、关联查询带 GROUP BY/HAVING/聚合等）抛出 `ValueError`；表文件不存在抛出 `FileNotFoundError`；引用不存在的列抛出 `KeyError`；WHERE 数值比较读取的任何单元格（不随 OR 分支短路）或已匹配行的聚合目标列含无法按有限十进制数读取的字段时抛出 `ValueError`（文本不会被静默转成数字）。查询不会在数据目录中创建或修改文件。
 
 ## 约定
 
