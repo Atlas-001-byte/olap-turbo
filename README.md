@@ -14,7 +14,26 @@
 
 ```
 python -m olap_turbo --data-dir <目录> --query <SQL>
+python -m olap_turbo --data-dir <目录> --query <SQL> --explain
 ```
+
+`--query` 必填；加 `--explain` 时只输出查询计划 JSON，不读取任何数据行（只读 CSV 表头），也可在代码中调用 `explain(data_dir, sql)`。无 `--explain` 时命令行与 `execute(data_dir, sql)` 的结果和行为完全不变。
+
+计划 JSON 为单个对象，字段固定、顺序如下：
+
+- `query_type`：`projection`、`aggregate`、`grouped_aggregate`、`join` 之一。
+- `tables`：表名数组，顺序同 FROM、JOIN（单表一个元素，连接两个）。
+- `scan_columns`：执行时实际读取的列，按 CSV 表头中的列顺序排列；单表查询写裸列名，连接查询写 `表名.列名`。投影列、聚合列、分组列、WHERE 列、ON 列与连接 ORDER BY 列计入，`count(*)` 不计入。
+- `where_columns`：WHERE 中引用的列，按首次出现去重；单表为裸列名，连接查询按源文本（带表名限定时写 `表名.列名`）；无 WHERE 时为 `[]`。
+- `select_columns`：SELECT 选择项原文（如 `id`、`left.a`、`count(*)`、`sum(amount)`），按首次出现去重。
+- `group_columns`：GROUP BY 列，按首次出现去重，且排在 WHERE 列、SELECT 选择项之后（分组列本就位于 SELECT 开头，通常为 `[]`）。
+- `aggregates`：SELECT 中的聚合项，按 SELECT 顺序排列，每项含 `function`（`count`/`sum`/`avg`/`min`/`max`，小写）、`column`（聚合列名，`count(*)` 为 `null`）、`text`（源文本）；无聚合时为 `[]`。HAVING 只允许引用已有聚合，不影响该列表。
+- `join`：非连接查询为 `null`；连接查询为含 `left_table`、`right_table`、`left_column`、`right_column` 的对象，列名按源文本（FROM 表的列为 `left_column`，与 ON 书写顺序无关）。
+- `order_by`：按原序排列，每项含 `expression`（源文本）与 `direction`（`ASC` 或 `DESC`）；无 ORDER BY 时为 `[]`。
+- `limit`：非负整数或 `null`。
+
+字符串均为 SQL 源文本，数字与空值用 JSON 原生表示；计划中不含耗时、行数或任何执行统计。`explain` 沿用现有解析与表头列校验：表不存在抛 `FileNotFoundError`，列不存在抛 `KeyError`，SQL 无效或不支持抛 `ValueError`；只读表头，非数字单元格不会导致失败。
+
 
 - 表为 `<目录>/<表名>.csv`，表名为去掉 `.csv` 的文件名；首行为列名，后续每行为记录。
 - 普通查询：`SELECT 列 [, 列 ...] FROM 表 [WHERE 条件]`，输出 `columns`、`rows`、`row_count`。

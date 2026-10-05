@@ -44,6 +44,14 @@ single-table projections.
 
 All arithmetic and numeric comparison go through :class:`decimal.Decimal`
 so results are deterministic and free of binary-float artifacts.
+
+:func:`explain` never runs any of this: it parses the SQL, opens the
+referenced tables and reads *only* their headers, then reports the column
+pruning (``scan_columns``), the pushed-down predicate columns
+(``where_columns``) and the execution order (query type, aggregates, join,
+ORDER BY and LIMIT) as a plan dict. Data rows are never read or parsed, so
+non-numeric cells cannot fail a plan, and no rows, row counts or timings
+are reported.
 """
 
 from __future__ import annotations
@@ -491,6 +499,16 @@ def _run_batches(
     }
 
 
+def _read_header(path: Path) -> List[str]:
+    """Read only a CSV table's header (column names), never its data rows."""
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh)
+        try:
+            return next(reader)
+        except StopIteration:
+            return []
+
+
 def _read_table(path: Path) -> Tuple[List[str], List[List[str]]]:
     """Read a CSV table into its header and raw data rows (CSV order)."""
     with open(path, "r", encoding="utf-8", newline="") as fh:
@@ -656,6 +674,35 @@ def _eval_join_where(
     return _combine(node.op, vectors)
 
 
+def _resolve_join_order_by(
+    query: Query,
+    resolve,
+    select_positions: List[Tuple[int, int]],
+) -> List[Tuple[int, bool]]:
+    """Resolve each join ORDER BY item to ``(select_position, descending)``.
+
+    Each sort item is resolved through the two headers (so bare and
+    qualified references to the same column are identical) and then mapped
+    to its position in the SELECT list; duplicates and unselected columns
+    fail exactly as during execution.
+    """
+    order_positions = []
+    seen: set = set()
+    for sort_item in query.order_by:
+        position = resolve(sort_item.table, sort_item.column)
+        if position in seen:
+            raise ValueError(f"duplicate ORDER BY item {sort_item.text!r}")
+        seen.add(position)
+        try:
+            idx = select_positions.index(position)
+        except ValueError:
+            raise ValueError(
+                f"ORDER BY column {sort_item.text!r} is not in the SELECT list"
+            )
+        order_positions.append((idx, sort_item.descending))
+    return order_positions
+
+
 def _run_join(data_dir: str, query: Query) -> Dict[str, Any]:
     """Execute the single supported INNER JOIN query end to end."""
     left_table = query.table
@@ -731,26 +778,9 @@ def _run_join(data_dir: str, query: Query) -> Dict[str, Any]:
     # keeps join row order (left CSV order, then right CSV order). LIMIT
     # truncates last.
     if query.order_by:
-        # Resolve each sort item through the two headers (so bare and
-        # qualified references to the same column are identical) and map it
-        # to its position in the SELECT list.
-        order_positions = []
-        seen: set = set()
-        for sort_item in query.order_by:
-            position = resolve(sort_item.table, sort_item.column)
-            if position in seen:
-                raise ValueError(
-                    f"duplicate ORDER BY item {sort_item.text!r}"
-                )
-            seen.add(position)
-            try:
-                idx = select_positions.index(position)
-            except ValueError:
-                raise ValueError(
-                    f"ORDER BY column {sort_item.text!r} is not in the "
-                    "SELECT list"
-                )
-            order_positions.append((idx, sort_item.descending))
+        order_positions = _resolve_join_order_by(
+            query, resolve, select_positions
+        )
         for idx, descending in reversed(order_positions):
             result["rows"].sort(
                 key=lambda row, i=idx: _sort_key(row[i]), reverse=descending
@@ -844,6 +874,243 @@ def execute(data_dir: str, sql: str) -> Dict[str, Any]:
         if query.limit is not None:
             _apply_limit(result, query.limit)
         return result
+
+
+# ----- query plan (EXPLAIN) -----
+
+
+def _query_type(query: Query) -> str:
+    if query.is_join:
+        return "join"
+    if query.is_grouped:
+        return "grouped_aggregate"
+    if query.is_aggregate:
+        return "aggregate"
+    return "projection"
+
+
+def _where_column_names(node: WhereExpr) -> List[str]:
+    """WHERE columns in first-appearance order, without qualification."""
+    names: List[str] = []
+    seen: set = set()
+
+    def walk(expr: WhereExpr) -> None:
+        if isinstance(expr, Comparison):
+            if expr.column not in seen:
+                seen.add(expr.column)
+                names.append(expr.column)
+            return
+        for operand in expr.operands:
+            walk(operand)
+
+    walk(node)
+    return names
+
+
+def _plan_select_columns(query: Query) -> List[str]:
+    """SELECT item source texts, deduplicated by first appearance.
+
+    Grouped queries lead with the GROUP BY columns (already their SELECT
+    texts), so they and ``count(*)`` collapse with any repeat references.
+    """
+    texts: List[str] = []
+    seen: set = set()
+    for item in query.select:
+        if item.text not in seen:
+            seen.add(item.text)
+            texts.append(item.text)
+    return texts
+
+
+def _plan_group_columns(query: Query) -> List[str]:
+    """GROUP BY columns, deduplicated after the SELECT references."""
+    seen = set(_plan_select_columns(query))
+    return [name for name in query.group_by if not (name in seen or seen.add(name))]
+
+
+def _plan_aggregates(query: Query) -> List[Dict[str, Any]]:
+    """Aggregate SELECT items in SELECT order: function, column and text."""
+    aggregates = []
+    for item in query.select:
+        if item.kind == "count_star":
+            aggregates.append({"function": "count", "column": None, "text": item.text})
+        elif item.kind in _AGG_KINDS:
+            aggregates.append(
+                {"function": item.kind, "column": item.column, "text": item.text}
+            )
+    return aggregates
+
+
+def _plan_order_by(query: Query) -> List[Dict[str, Any]]:
+    return [
+        {
+            "expression": item.text,
+            "direction": "DESC" if item.descending else "ASC",
+        }
+        for item in query.order_by
+    ]
+
+
+def _plan_scan_columns(
+    query: Query, header: Sequence[str]
+) -> List[str]:
+    """Actually read columns, ordered by their position in the CSV header.
+
+    The single-table scan materializes the projected/aggregate/GROUP BY
+    columns and the WHERE columns; ``count(*)`` reads no column.
+    """
+    wanted = set(query.required_columns())
+    return [name for name in header if name in wanted]
+
+
+def _validate_scan_columns(query: Query, header: Sequence[str], table: str) -> None:
+    for name in query.required_columns():
+        if name not in header:
+            raise KeyError(
+                f"column {name!r} does not exist in table {table!r}"
+            )
+
+
+def _explain_scan(data_dir: str, query: Query) -> Dict[str, Any]:
+    # The single table is opened (FileNotFoundError when absent), but only
+    # its header row is read.
+    header = _read_header(Path(data_dir) / f"{query.table}.csv")
+    _validate_scan_columns(query, header, query.table)
+    return {
+        "query_type": _query_type(query),
+        "tables": [query.table],
+        "scan_columns": _plan_scan_columns(query, header),
+        "where_columns": (
+            _where_column_names(query.where) if query.where is not None else []
+        ),
+        "select_columns": _plan_select_columns(query),
+        "group_columns": _plan_group_columns(query),
+        "aggregates": _plan_aggregates(query),
+        "join": None,
+        "order_by": _plan_order_by(query),
+        "limit": query.limit,
+    }
+
+
+def _join_where_columns(node: WhereExpr) -> List[str]:
+    """Qualified WHERE reference texts, in first-appearance order."""
+    texts: List[str] = []
+    seen: set = set()
+
+    def walk(expr: WhereExpr) -> None:
+        if isinstance(expr, Comparison):
+            text = expr.column if expr.table is None else f"{expr.table}.{expr.column}"
+            if text not in seen:
+                seen.add(text)
+                texts.append(text)
+            return
+        for operand in expr.operands:
+            walk(operand)
+
+    walk(node)
+    return texts
+
+
+def _explain_join(data_dir: str, query: Query) -> Dict[str, Any]:
+    left_table = query.table
+    right_table = query.join_table
+    # Both tables are opened for their headers only; FROM first, JOIN second.
+    left_header = _read_header(Path(data_dir) / f"{left_table}.csv")
+    right_header = _read_header(Path(data_dir) / f"{right_table}.csv")
+
+    def resolve(table: Optional[str], name: str) -> Tuple[int, int]:
+        return _resolve_join_column(
+            table, name, left_table, right_table, left_header, right_header
+        )
+
+    # The same header resolution execution performs, without reading any
+    # data row: ON, then SELECT, then WHERE, then ORDER BY.
+    left_pos, right_pos = _resolve_on(
+        query.join_on, left_table, right_table, left_header, right_header
+    )
+    # Align each ON reference text with its table: the reference resolving
+    # to the FROM table is left_column, regardless of the order written.
+    on_refs = (query.join_on.left, query.join_on.right)
+    on_by_side = {}
+    for ref in on_refs:
+        side, _ = resolve(ref.table, ref.name)
+        on_by_side[side] = ref.text
+    select_positions = [
+        resolve(item.table, item.column) for item in query.select
+    ]
+    if query.where is not None:
+        where_positions: Dict[int, Tuple[int, int]] = {}
+        _resolve_where_positions(
+            query.where, where_positions,
+            left_table, right_table, left_header, right_header,
+        )
+    if query.order_by:
+        _resolve_join_order_by(query, resolve, select_positions)
+
+    # Map each (side, header_index) actually read to its qualified name.
+    read_positions = {left_pos, right_pos}
+    read_positions.update(select_positions)
+    if query.where is not None:
+        read_positions.update(where_positions.values())
+    for item in query.order_by:
+        read_positions.add(resolve(item.table, item.column))
+
+    def qualified(side: int, idx: int) -> str:
+        table = left_table if side == 0 else right_table
+        name = (left_header if side == 0 else right_header)[idx]
+        return f"{table}.{name}"
+
+    wanted = {
+        qualified(side, idx)
+        for side, idx in read_positions
+    }
+    scan_columns = [
+        f"{left_table}.{name}"
+        for name in left_header
+        if f"{left_table}.{name}" in wanted
+    ]
+    scan_columns.extend(
+        f"{right_table}.{name}"
+        for name in right_header
+        if f"{right_table}.{name}" in wanted
+    )
+
+    return {
+        "query_type": "join",
+        "tables": [left_table, right_table],
+        "scan_columns": scan_columns,
+        "where_columns": (
+            _join_where_columns(query.where)
+            if query.where is not None else []
+        ),
+        "select_columns": _plan_select_columns(query),
+        "group_columns": [],
+        "aggregates": [],
+        "join": {
+            "left_table": left_table,
+            "right_table": right_table,
+            "left_column": on_by_side[0],
+            "right_column": on_by_side[1],
+        },
+        "order_by": _plan_order_by(query),
+        "limit": query.limit,
+    }
+
+
+def explain(data_dir: str, sql: str) -> Dict[str, Any]:
+    """Return the query plan for *sql* without reading any table data.
+
+    Only CSV headers are read, so non-numeric data cells never fail a plan.
+
+    Raises:
+        FileNotFoundError: a table's CSV file does not exist.
+        KeyError: the query references a column absent from a header.
+        ValueError: the SQL is malformed or unsupported.
+    """
+    query: Query = parse_sql(sql)
+    if query.is_join:
+        return _explain_join(data_dir, query)
+    return _explain_scan(data_dir, query)
 
 
 def render(result: Dict[str, Any]) -> str:

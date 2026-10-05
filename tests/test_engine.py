@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from olap_turbo import execute
+from olap_turbo import execute, explain
 from olap_turbo.engine import BATCH_SIZE, render
 from olap_turbo.sql import parse_sql
 
@@ -2303,3 +2303,392 @@ def test_join_cli(join_dir):
         "rows": [[14, "gamma"], [13, "beta"]],
         "row_count": 2,
     }
+
+
+# ---------- EXPLAIN query plan ----------
+
+def test_explain_projection(data_dir):
+    plan = explain(
+        str(data_dir),
+        'SELECT amount, id FROM sales WHERE region = "east" AND id > 1 '
+        "ORDER BY id DESC LIMIT 2",
+    )
+    assert plan == {
+        "query_type": "projection",
+        "tables": ["sales"],
+        # Header order is id, region, amount, note; note is never read.
+        "scan_columns": ["id", "region", "amount"],
+        "where_columns": ["region", "id"],
+        "select_columns": ["amount", "id"],
+        "group_columns": [],
+        "aggregates": [],
+        "join": None,
+        "order_by": [{"expression": "id", "direction": "DESC"}],
+        "limit": 2,
+    }
+
+
+def test_explain_projection_no_clauses(data_dir):
+    plan = explain(str(data_dir), "SELECT amount, id FROM sales")
+    assert plan["query_type"] == "projection"
+    assert plan["tables"] == ["sales"]
+    assert plan["scan_columns"] == ["id", "amount"]
+    assert plan["where_columns"] == []
+    assert plan["select_columns"] == ["amount", "id"]
+    assert plan["group_columns"] == []
+    assert plan["aggregates"] == []
+    assert plan["join"] is None
+    assert plan["order_by"] == []
+    assert plan["limit"] is None
+
+
+def test_explain_count_star_reads_no_column(data_dir):
+    plan = explain(str(data_dir), "SELECT count(*) FROM sales")
+    assert plan["query_type"] == "aggregate"
+    assert plan["scan_columns"] == []
+    assert plan["where_columns"] == []
+    assert plan["select_columns"] == ["count(*)"]
+    assert plan["aggregates"] == [
+        {"function": "count", "column": None, "text": "count(*)"}
+    ]
+    assert plan["group_columns"] == []
+    assert plan["order_by"] == []
+    assert plan["limit"] is None
+
+
+def test_explain_aggregate_with_where_and_order(data_dir):
+    plan = explain(
+        str(data_dir),
+        "SELECT count(*), sum(amount), avg(amount), min(amount), max(amount) "
+        'FROM sales WHERE note = "b" OR id = 4 ORDER BY sum(amount) DESC LIMIT 1',
+    )
+    assert plan["query_type"] == "aggregate"
+    assert plan["scan_columns"] == ["id", "amount", "note"]
+    assert plan["where_columns"] == ["note", "id"]
+    assert plan["select_columns"] == [
+        "count(*)", "sum(amount)", "avg(amount)", "min(amount)", "max(amount)",
+    ]
+    assert plan["group_columns"] == []
+    assert plan["aggregates"] == [
+        {"function": "count", "column": None, "text": "count(*)"},
+        {"function": "sum", "column": "amount", "text": "sum(amount)"},
+        {"function": "avg", "column": "amount", "text": "avg(amount)"},
+        {"function": "min", "column": "amount", "text": "min(amount)"},
+        {"function": "max", "column": "amount", "text": "max(amount)"},
+    ]
+    assert plan["join"] is None
+    assert plan["order_by"] == [{"expression": "sum(amount)", "direction": "DESC"}]
+    assert plan["limit"] == 1
+
+
+def test_explain_grouped_aggregate(data_dir):
+    plan = explain(
+        str(data_dir),
+        "SELECT region, count(*), sum(amount) FROM sales "
+        "WHERE id != 4 GROUP BY region HAVING count(*) >= 2 "
+        "ORDER BY sum(amount) DESC, region ASC LIMIT 3",
+    )
+    assert plan["query_type"] == "grouped_aggregate"
+    assert plan["tables"] == ["sales"]
+    assert plan["scan_columns"] == ["id", "region", "amount"]
+    assert plan["where_columns"] == ["id"]
+    assert plan["select_columns"] == ["region", "count(*)", "sum(amount)"]
+    # region already leads the SELECT list, so group_columns stays empty.
+    assert plan["group_columns"] == []
+    assert plan["aggregates"] == [
+        {"function": "count", "column": None, "text": "count(*)"},
+        {"function": "sum", "column": "amount", "text": "sum(amount)"},
+    ]
+    assert plan["join"] is None
+    assert plan["order_by"] == [
+        {"expression": "sum(amount)", "direction": "DESC"},
+        {"expression": "region", "direction": "ASC"},
+    ]
+    assert plan["limit"] == 3
+
+
+def test_explain_multi_column_grouped(tmp_path):
+    (tmp_path / "t.csv").write_text("a,b,v,noise\n1,x,9,z\n", encoding="utf-8")
+    plan = explain(
+        str(tmp_path), "SELECT a, b, count(*), sum(v) FROM t GROUP BY a, b"
+    )
+    assert plan["query_type"] == "grouped_aggregate"
+    assert plan["scan_columns"] == ["a", "b", "v"]
+    assert plan["where_columns"] == []
+    assert plan["select_columns"] == ["a", "b", "count(*)", "sum(v)"]
+    assert plan["group_columns"] == []
+    assert plan["aggregates"] == [
+        {"function": "count", "column": None, "text": "count(*)"},
+        {"function": "sum", "column": "v", "text": "sum(v)"},
+    ]
+    assert plan["order_by"] == []
+    assert plan["limit"] is None
+
+
+def test_explain_where_columns_first_appearance_dedup(tmp_path):
+    (tmp_path / "t.csv").write_text("a,b,c\n1,2,3\n", encoding="utf-8")
+    plan = explain(
+        str(tmp_path),
+        "SELECT c FROM t WHERE (a = 1 OR b = 2) AND b = 3 AND c = 1",
+    )
+    assert plan["where_columns"] == ["a", "b", "c"]
+    assert plan["scan_columns"] == ["a", "b", "c"]
+    assert plan["select_columns"] == ["c"]
+
+
+def test_explain_join(join_dir):
+    plan = explain(
+        str(join_dir),
+        "SELECT orders.oid, customers.name FROM orders INNER JOIN customers "
+        'ON orders.cust = customers.cust_key WHERE orders.oid >= 12 '
+        'AND name = "alpha" ORDER BY orders.oid DESC LIMIT 1',
+    )
+    assert plan == {
+        "query_type": "join",
+        "tables": ["orders", "customers"],
+        "scan_columns": [
+            "orders.oid", "orders.cust",
+            "customers.cust_key", "customers.name",
+        ],
+        "where_columns": ["orders.oid", "name"],
+        "select_columns": ["orders.oid", "customers.name"],
+        "group_columns": [],
+        "aggregates": [],
+        "join": {
+            "left_table": "orders",
+            "right_table": "customers",
+            "left_column": "orders.cust",
+            "right_column": "customers.cust_key",
+        },
+        "order_by": [{"expression": "orders.oid", "direction": "DESC"}],
+        "limit": 1,
+    }
+
+
+def test_explain_join_reversed_on_and_bare_refs(join_dir):
+    # ON written right-first; bare columns elsewhere. The plan aligns each
+    # ON column with its own table, independent of written order.
+    plan = explain(
+        str(join_dir),
+        "SELECT oid, name FROM orders INNER JOIN customers "
+        "ON customers.cust_key = cust",
+    )
+    assert plan["tables"] == ["orders", "customers"]
+    assert plan["join"] == {
+        "left_table": "orders",
+        "right_table": "customers",
+        "left_column": "cust",
+        "right_column": "customers.cust_key",
+    }
+    assert plan["scan_columns"] == [
+        "orders.oid", "orders.cust", "customers.cust_key", "customers.name",
+    ]
+    assert plan["where_columns"] == []
+    assert plan["select_columns"] == ["oid", "name"]
+    assert plan["order_by"] == []
+    assert plan["limit"] is None
+
+
+def test_explain_join_where_order_is_header_order(join_dir):
+    plan = explain(
+        str(join_dir),
+        "SELECT customers.name FROM orders INNER JOIN customers "
+        "ON orders.cust = customers.cust_key WHERE customers.name = \"beta\"",
+    )
+    # Left table ON column comes first (header order), then right header:
+    # cust_key precedes name.
+    assert plan["scan_columns"] == [
+        "orders.cust", "customers.cust_key", "customers.name",
+    ]
+    assert plan["where_columns"] == ["customers.name"]
+
+
+def test_explain_only_reads_header_non_number_cells_ok(data_dir):
+    # Row 4's amount is "abc": explain never parses it.
+    plan = explain(str(data_dir), "SELECT count(*), sum(amount) FROM sales")
+    assert plan["scan_columns"] == ["amount"]
+    plan = explain(
+        str(data_dir),
+        "SELECT id FROM sales WHERE amount >= 0 OR id = 4",
+    )
+    assert plan["where_columns"] == ["amount", "id"]
+    assert plan["scan_columns"] == ["id", "amount"]
+
+
+def test_explain_does_not_read_rows(data_dir):
+    # A data file with a valid header but malformed rows still plans fine.
+    (data_dir / "broken.csv").write_text(
+        "a,b\n1,\"unterminated\n", encoding="utf-8"
+    )
+    plan = explain(str(data_dir), "SELECT a FROM broken WHERE b = 1")
+    assert plan["tables"] == ["broken"]
+    assert plan["scan_columns"] == ["a", "b"]
+
+
+def test_explain_missing_table_raises_filenotfound(data_dir):
+    with pytest.raises(FileNotFoundError):
+        explain(str(data_dir), "SELECT a FROM nope")
+    with pytest.raises(FileNotFoundError):
+        explain(
+            str(data_dir),
+            "SELECT orders.oid FROM orders INNER JOIN nope ON orders.cust = nope.k",
+        )
+
+
+def test_explain_unknown_column_raises_keyerror(data_dir):
+    with pytest.raises(KeyError):
+        explain(str(data_dir), "SELECT missing FROM sales")
+    with pytest.raises(KeyError):
+        explain(str(data_dir), "SELECT id FROM sales WHERE missing = 1")
+    with pytest.raises(KeyError):
+        explain(str(data_dir), "SELECT count(*), sum(missing) FROM sales")
+    with pytest.raises(KeyError):
+        explain(
+            str(data_dir),
+            "SELECT region, count(*), sum(missing) FROM sales GROUP BY region",
+        )
+
+
+def test_explain_join_unknown_column_raises_keyerror(join_dir):
+    base = "FROM orders INNER JOIN customers ON orders.cust = customers.cust_key"
+    with pytest.raises(KeyError):
+        explain(str(join_dir), f"SELECT missing, orders.oid {base}")
+    with pytest.raises(KeyError):
+        explain(str(join_dir), f"SELECT orders.oid {base} WHERE customers.missing = 1")
+    with pytest.raises(KeyError):
+        explain(
+            str(join_dir),
+            "SELECT orders.oid FROM orders INNER JOIN customers "
+            "ON orders.cust = missing",
+        )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "",
+        "SELECT * FROM sales",
+        "SELECT a sales",
+        "DELETE FROM sales",
+        "SELECT id FROM sales ORDER BY missing",
+        "SELECT id FROM sales LIMIT -1",
+        "SELECT oid FROM orders INNER JOIN customers ON cust > cust_key",
+        "SELECT count(*) FROM orders INNER JOIN customers ON cust = cust_key",
+    ],
+)
+def test_explain_bad_sql_raises_valueerror(join_dir, sql):
+    with pytest.raises(ValueError):
+        explain(str(join_dir), sql)
+
+
+def test_explain_join_ambiguous_bare_column_raises_valueerror(tmp_path):
+    (tmp_path / "l.csv").write_text("id,k\n1,1\n", encoding="utf-8")
+    (tmp_path / "r.csv").write_text("id,k\n1,1\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        explain(
+            str(tmp_path),
+            "SELECT id FROM l INNER JOIN r ON l.id = r.id",
+        )
+    with pytest.raises(ValueError):
+        explain(
+            str(tmp_path),
+            "SELECT l.id FROM l INNER JOIN r ON l.id = r.id WHERE id = 1",
+        )
+    with pytest.raises(ValueError):
+        explain(
+            str(tmp_path),
+            "SELECT l.id FROM l INNER JOIN r ON l.id = r.id ORDER BY id",
+        )
+
+
+def test_explain_empty_table_header(tmp_path):
+    (tmp_path / "e.csv").write_text("", encoding="utf-8")
+    # An empty header means every referenced column is missing: KeyError.
+    with pytest.raises(KeyError):
+        explain(str(tmp_path), "SELECT a FROM e")
+    plan = explain(str(tmp_path), "SELECT count(*) FROM e")
+    assert plan["scan_columns"] == []
+    assert plan["query_type"] == "aggregate"
+
+
+def test_explain_render_is_single_json_object(data_dir):
+    payload = json.loads(
+        render(explain(str(data_dir), "SELECT id FROM sales WHERE id = 1 LIMIT 1"))
+    )
+    assert set(payload) == {
+        "query_type", "tables", "scan_columns", "where_columns",
+        "select_columns", "group_columns", "aggregates", "join",
+        "order_by", "limit",
+    }
+    # No execution statistics leak into the plan.
+    assert "rows" not in payload
+    assert "row_count" not in payload
+    assert "columns" not in payload
+
+
+def test_explain_query_still_required_by_cli(data_dir):
+    proc = subprocess.run(
+        [sys.executable, "-m", "olap_turbo", "--data-dir", str(data_dir)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+
+
+def test_explain_cli(data_dir):
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "olap_turbo",
+            "--data-dir", str(data_dir),
+            "--query", 'SELECT id FROM sales WHERE region = "east" ORDER BY id LIMIT 1',
+            "--explain",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(proc.stdout)
+    assert payload == {
+        "query_type": "projection",
+        "tables": ["sales"],
+        "scan_columns": ["id", "region"],
+        "where_columns": ["region"],
+        "select_columns": ["id"],
+        "group_columns": [],
+        "aggregates": [],
+        "join": None,
+        "order_by": [{"expression": "id", "direction": "ASC"}],
+        "limit": 1,
+    }
+    assert "rows" not in payload
+
+
+def test_explain_cli_join(join_dir):
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "olap_turbo",
+            "--data-dir", str(join_dir),
+            "--query",
+            "SELECT orders.oid FROM orders INNER JOIN customers "
+            "ON orders.cust = customers.cust_key",
+            "--explain",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(proc.stdout)
+    assert payload["query_type"] == "join"
+    assert payload["tables"] == ["orders", "customers"]
+    assert payload["join"] == {
+        "left_table": "orders",
+        "right_table": "customers",
+        "left_column": "orders.cust",
+        "right_column": "customers.cust_key",
+    }
+    assert payload["scan_columns"] == [
+        "orders.oid", "orders.cust", "customers.cust_key",
+    ]
