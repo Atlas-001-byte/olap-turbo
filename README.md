@@ -8,7 +8,7 @@
 
 ## 状态
 
-首个可查询基线：CSV 表上的 SELECT/WHERE，支持列裁剪、谓词先于投影的批处理向量化执行，单列与多列 GROUP BY 分组聚合（`count(*)`、`sum`、`avg`、`min`、`max`），WHERE 中以 AND、OR 与嵌套圆括号组合的布尔条件，聚合结果上的 HAVING 分组后过滤，结果集上的 ORDER BY 排序与 LIMIT 截断，以及恰好一次 INNER JOIN 的两表关联（关联后继续走 WHERE、投影、ORDER BY 与 LIMIT）。
+首个可查询基线：CSV 表上的 SELECT/WHERE，支持列裁剪、谓词先于投影的批处理向量化执行，单列与多列 GROUP BY 分组聚合（`count(*)`、`sum`、`avg`、`min`、`max`），WHERE 中以 AND、OR 与嵌套圆括号组合的布尔条件，聚合结果上的 HAVING 分组后过滤，结果集上的 ORDER BY 排序与 LIMIT 截断，恰好一次 INNER JOIN 的两表关联（关联后继续走 WHERE、投影、ORDER BY 与 LIMIT），以及连接后的全局聚合与分组聚合（连接展开、WHERE 过滤后再做 GROUP BY、聚合、HAVING、ORDER BY 与 LIMIT）。
 
 ## 用法
 
@@ -30,7 +30,7 @@ python -m olap_turbo --data-dir <目录> --query <SQL> --explain
   - `where_columns`：WHERE 引用的列，按首次出现去重。
   - `select_columns`：SELECT 中普通列/分组列的选择项原文，按首次出现去重（聚合表达式不在此列）。
   - `group_columns`：GROUP BY 列（按其顺序），无分组时为 `[]`。
-  - `aggregates`：SELECT 中聚合按 SELECT 顺序排列的对象，含 `function`（函数小写名，`count(*)` 为 `"count"`）、`column`（`count(*)` 为 `null`）、`text`（表达式原文）；HAVING 只引用其中已有项。
+  - `aggregates`：SELECT 中聚合按 SELECT 顺序排列的对象，含 `function`（函数小写名，`count(*)` 为 `"count"`）、`column`（`count(*)` 为 `null`，连接查询中带限定写法的参数保留 `表名.列名` 原文）、`text`（表达式原文）；HAVING 只引用其中已有项。
   - `join`：非连接查询为 `null`；连接查询为含 `left_table`、`right_table`、`left_column`、`right_column` 的对象。
   - `order_by`：排序项原序数组，每项含 `expression`（表达式原文）与 `direction`（`ASC` 或 `DESC`），无子句时为 `[]`。
   - `limit`：非负整数或 `null`。
@@ -39,7 +39,8 @@ python -m olap_turbo --data-dir <目录> --query <SQL> --explain
 
 - 表为 `<目录>/<表名>.csv`，表名为去掉 `.csv` 的文件名；首行为列名，后续每行为记录。
 - 普通查询：`SELECT 列 [, 列 ...] FROM 表 [WHERE 条件]`，输出 `columns`、`rows`、`row_count`。
-- 两表内连接：`SELECT 选择项, 选择项 FROM 左表 INNER JOIN 右表 ON 左列 = 右列 [WHERE 条件] [ORDER BY 排序项...] [LIMIT n]`。两张表分别从 `<目录>/<左表>.csv` 与 `<目录>/<右表>.csv` 读取，本形态只支持恰好一次 INNER JOIN，不支持别名、LEFT JOIN、多段 JOIN、GROUP BY、HAVING 或聚合 SELECT（出现这些写法抛出 `ValueError`）。SELECT、ON、WHERE、ORDER BY 中可用 `表名.列名` 限定列；不带前缀的列在两张表中唯一归属一张表时可直接引用，若在两表中重名则必须加表名限定，否则抛出 `ValueError`；左右表同名也抛出 `ValueError`。ON 必须恰好是一对分别来自左右两表的列以 `=` 相等比较：不能比较字面量、不能引用同一张表的两列、不能用 `=` 以外的运算符、不能用 AND/OR 组合多个条件或再写一段 JOIN，否则抛出 `ValueError`（ON 列可写不带前缀的列名，但两列必须分别唯一归属两张表）。连接键两边都是有限十进制数时按精确数值相等匹配（`1` 与 `1.0` 相配），否则一律按原文精确比较，数值与文本永不相配。每个左行按左表 CSV 行序、对每个左行按右表 CSV 行序连接全部匹配的右行（一对多全部展开）；连接完成后才执行 WHERE，随后按 SELECT 投影，再做稳定 ORDER BY（完全相同的排序键保留连接行序）与最后的 LIMIT。`columns` 按 SELECT 顺序保留带表名限定的选择项原文文本；`LIMIT 0` 保留原 `columns`、`rows` 为 `[]`、`row_count` 为 0。
+- 两表内连接：`SELECT 选择项, 选择项 FROM 左表 INNER JOIN 右表 ON 左列 = 右列 [WHERE 条件] [ORDER BY 排序项...] [LIMIT n]`。两张表分别从 `<目录>/<左表>.csv` 与 `<目录>/<右表>.csv` 读取，本形态只支持恰好一次 INNER JOIN，不支持别名、LEFT JOIN 或多段 JOIN（出现这些写法抛出 `ValueError`）。SELECT、ON、WHERE、GROUP BY、HAVING、ORDER BY 中可用 `表名.列名` 限定列；不带前缀的列在两张表中唯一归属一张表时可直接引用，若在两表中重名则必须加表名限定，否则抛出 `ValueError`；左右表同名也抛出 `ValueError`。ON 必须恰好是一对分别来自左右两表的列以 `=` 相等比较：不能比较字面量、不能引用同一张表的两列、不能用 `=` 以外的运算符、不能用 AND/OR 组合多个条件或再写一段 JOIN，否则抛出 `ValueError`（ON 列可写不带前缀的列名，但两列必须分别唯一归属两张表）。连接键两边都是有限十进制数时按精确数值相等匹配（`1` 与 `1.0` 相配），否则一律按原文精确比较，数值与文本永不相配。每个左行按左表 CSV 行序、对每个左行按右表 CSV 行序连接全部匹配的右行（一对多全部展开）；连接完成后才执行 WHERE，随后按 SELECT 投影，再做稳定 ORDER BY（完全相同的排序键保留连接行序）与最后的 LIMIT。`columns` 按 SELECT 顺序保留带表名限定的选择项原文文本；`LIMIT 0` 保留原 `columns`、`rows` 为 `[]`、`row_count` 为 0。
+- 连接后聚合：在同样的一次 INNER JOIN 之上可写全局聚合（`SELECT count(*) [, 聚合 ...] FROM 左表 INNER JOIN 右表 ON ... [WHERE ...] [HAVING ...] [ORDER BY ...] [LIMIT n]`）或分组聚合（`SELECT 分组列, ..., count(*), 聚合 [, 聚合 ...] FROM ... GROUP BY 分组列, ... [HAVING ...] [ORDER BY ...] [LIMIT n]`）。WHERE 作用于连接展开后的行，分组列与聚合参数可写连接列名或 `表名.列名`；分组、聚合、HAVING、ORDER BY 与 LIMIT 的规则与单表完全一致：SELECT 按 GROUP BY 的原顺序先列分组列、随后 `count(*)` 与至少一个其他聚合，聚合表达式不重复、不聚合分组列，HAVING 只比较 SELECT 已出现的聚合与有限十进制数，ORDER BY 只引用已出现的分组列或聚合，LIMIT 最后截断。连接键、分组键、聚合与排序沿用精确十进制或原文比较规则；无匹配行时全局 `count(*)` 为 0、`sum` 为 0、`avg`/`min`/`max` 为 `null`，HAVING 未通过时保留 `columns`、`rows` 为 `[]`。别名、外连接、多段 JOIN、非等值 ON、聚合参数表达式、无分组 SELECT 混入普通列、SELECT 与 GROUP BY 顺序不符均抛出 `ValueError`。
 - 聚合查询：`SELECT count(*) [, 聚合 ...] FROM 表 [WHERE 条件] [HAVING 聚合条件]`，聚合为 `sum(列)`、`avg(列)`、`min(列)`、`max(列)`，每个聚合表达式至多出现一次；`columns` 为原始表达式文本，通过 HAVING 时 `rows` 为单行、`row_count` 恒为 1，未通过时 `rows` 为 `[]`、`row_count` 为 0。无过滤行时 `count(*)` 为 0、`sum` 为数值 0、`avg`/`min`/`max` 为 JSON `null`。
 - 分组聚合：`SELECT 分组列1, 分组列2, ..., count(*) [, 聚合 ...] FROM 表 [WHERE 条件] GROUP BY 分组列1, 分组列2, ... [HAVING 聚合条件]`（一个或多个互不相同的分组列；单列分组为其特例）。SELECT 必须按 GROUP BY 的相同顺序开头列出全部分组列，其后为 `count(*)` 与一个或多个互不重复的聚合表达式（`sum`/`avg`/`min`/`max`，同一列可参与不同函数）。WHERE 先过滤再分组；每组一行，依次为各分组键、`count(*)` 与各聚合值，`row_count` 为分组数；分组按组合键在过滤后行序中首次出现的先后输出，空表或无匹配时 `rows` 为 `[]`、`row_count` 为 0。
 - HAVING 为聚合结果上的分组后过滤：全局聚合查询可写作 `SELECT count(*) [, 聚合 ...] FROM 表 [WHERE 条件] HAVING 聚合条件`，分组聚合查询将其固定置于 GROUP BY 之后；HAVING 至多出现一次，普通投影查询出现 HAVING 抛出 `ValueError`。执行顺序为 WHERE 先过滤，再形成全局聚合或组合键分组并精确求值，最后逐个判断 HAVING：全局聚合通过时仍输出原来的单行，未通过时 `rows` 为 `[]`、`row_count` 为 0；分组查询只保留通过的组，输出先后、`columns` 与每行字段顺序不变。
@@ -51,7 +52,7 @@ python -m olap_turbo --data-dir <目录> --query <SQL> --explain
 - 组合键的每个位置按该单元格值归并：可读成有限十进制数的值按十进制精确比较（故 `1` 与 `1.0` 在对应位置同组），其他值按原文比较并输出 JSON 字符串；各位置独立判断，文本不被强制转成数值。
 - 结果以 CSV 原始行序、按 SELECT 列序输出为单个 JSON 对象。扫描只读取分组列、聚合列与条件列，未引用列不影响结果。
 
-不支持的写法（NOT、括号包裹列/值/非布尔表达式、括号不配对、条件不完整或连续运算符、OR 出现在 WHERE/HAVING 之外、其他函数、通配符列、GROUP BY/HAVING/ORDER BY/LIMIT 之外的子句、子句乱序或子句重复、普通投影查询带 HAVING、HAVING 引用未选中的聚合或普通列/分组列、HAVING 右值为字符串或其他表达式、ORDER BY 引用未选中的列或聚合、重复排序项、LIMIT 缺值或非非负整数、SELECT 漏列或乱序列出分组列、分组列重复或被夹入聚合项、GROUP BY 重复列、缺少 `count(*)` 或聚合项、重复聚合、缺少 FROM 等）抛出 `ValueError`；关联查询中出现裸 `JOIN`/LEFT JOIN/多段 JOIN/别名/聚合/GROUP BY/HAVING、ON 不是唯一一对跨表列相等（字面量、同表两列、非 `=` 运算符、AND/OR 组合）、左右表同名、无前缀列在两表重名、`表名.列名` 的表名不是参与连接的两张表等同样抛出 `ValueError`；表文件不存在抛出 `FileNotFoundError`；引用不存在的列抛出 `KeyError`（关联查询中限定列在其指定表不存在、裸列在两表中都不存在）；WHERE 数值比较读取的任何单元格（不随 OR 分支短路，关联查询同样在连接后的行上全量校验）或已匹配行的聚合目标列含无法按有限十进制数读取的字段时抛出 `ValueError`（文本不会被静默转成数字）。查询不会在数据目录中创建或修改文件。
+不支持的写法（NOT、括号包裹列/值/非布尔表达式、括号不配对、条件不完整或连续运算符、OR 出现在 WHERE/HAVING 之外、其他函数、通配符列、GROUP BY/HAVING/ORDER BY/LIMIT 之外的子句、子句乱序或子句重复、普通投影查询带 HAVING、HAVING 引用未选中的聚合或普通列/分组列、HAVING 右值为字符串或其他表达式、ORDER BY 引用未选中的列或聚合、重复排序项、LIMIT 缺值或非非负整数、SELECT 漏列或乱序列出分组列、分组列重复或被夹入聚合项、GROUP BY 重复列、缺少 `count(*)` 或聚合项、重复聚合、缺少 FROM 等）抛出 `ValueError`；关联查询中出现裸 `JOIN`/LEFT JOIN/多段 JOIN/别名、ON 不是唯一一对跨表列相等（字面量、同表两列、非 `=` 运算符、AND/OR 组合）、左右表同名、无前缀列在两表重名、`表名.列名` 的表名不是参与连接的两张表等同样抛出 `ValueError`；表文件不存在抛出 `FileNotFoundError`；引用不存在的列抛出 `KeyError`（关联查询中限定列在其指定表不存在、裸列在两表中都不存在）；WHERE 数值比较读取的任何单元格（不随 OR 分支短路，关联查询同样在连接后的行上全量校验）或已匹配行的聚合目标列含无法按有限十进制数读取的字段时抛出 `ValueError`（文本不会被静默转成数字）。查询不会在数据目录中创建或修改文件。
 
 ## 约定
 

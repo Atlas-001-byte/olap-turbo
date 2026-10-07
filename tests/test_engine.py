@@ -2248,8 +2248,7 @@ def test_join_unknown_qualifier_raises_valueerror(join_dir):
         "SELECT oid FROM orders INNER JOIN customers ON",
         # no aliases
         "SELECT o.oid FROM orders o INNER JOIN customers c ON o.cust = c.cust_key",
-        # no aggregates / GROUP BY / HAVING
-        "SELECT count(*) FROM orders INNER JOIN customers ON cust = cust_key",
+        # aggregate shapes still rejected over a join
         "SELECT oid, sum(amt) FROM orders INNER JOIN customers ON cust = cust_key",
         "SELECT oid FROM orders INNER JOIN customers ON cust = cust_key GROUP BY oid",
         "SELECT oid FROM orders INNER JOIN customers ON cust = cust_key HAVING count(*) > 0",
@@ -2302,4 +2301,280 @@ def test_join_cli(join_dir):
         "columns": ["orders.oid", "customers.name"],
         "rows": [[14, "gamma"], [13, "beta"]],
         "row_count": 2,
+    }
+
+
+# ---------- join aggregation ----------
+
+JOIN_BASE = "FROM orders INNER JOIN customers ON orders.cust = customers.cust_key"
+
+
+def test_join_global_aggregate(join_dir):
+    result = execute(
+        str(join_dir),
+        "SELECT count(*), sum(orders.amt), avg(orders.amt), min(orders.amt), "
+        f"max(orders.amt) {JOIN_BASE}",
+    )
+    assert result["columns"] == [
+        "count(*)", "sum(orders.amt)", "avg(orders.amt)",
+        "min(orders.amt)", "max(orders.amt)",
+    ]
+    # Joined amounts: 100, 50.5, 25, 7, 9.
+    assert result["rows"] == [[5, Decimal("191.5"), Decimal("38.3"), 7, 100]]
+    assert result["row_count"] == 1
+
+
+def test_join_global_aggregate_bare_columns_and_where(join_dir):
+    result = execute(
+        str(join_dir),
+        f"SELECT count(*), sum(amt) {JOIN_BASE} "
+        'WHERE oid >= 11 AND name != "gamma"',
+    )
+    # Joined rows 11/12 (alpha) and 13 (beta) survive; amounts 50.5, 25, 7.
+    assert result["rows"] == [[3, Decimal("82.5")]]
+
+
+def test_join_global_aggregate_empty_match(join_dir):
+    result = execute(
+        str(join_dir),
+        f"SELECT count(*), sum(amt), avg(amt), min(amt), max(amt) {JOIN_BASE} "
+        "WHERE oid > 100",
+    )
+    assert result == {
+        "columns": ["count(*)", "sum(amt)", "avg(amt)", "min(amt)", "max(amt)"],
+        "rows": [[0, 0, None, None, None]],
+        "row_count": 1,
+    }
+
+
+def test_join_global_aggregate_having(join_dir):
+    result = execute(
+        str(join_dir),
+        f"SELECT count(*), sum(amt) {JOIN_BASE} HAVING count(*) >= 5 AND sum(amt) > 100",
+    )
+    assert result["rows"] == [[5, Decimal("191.5")]]
+    # A failing HAVING keeps the columns but empties the rows.
+    result = execute(
+        str(join_dir),
+        f"SELECT count(*), sum(amt) {JOIN_BASE} HAVING count(*) > 5 OR sum(amt) < 100",
+    )
+    assert result == {
+        "columns": ["count(*)", "sum(amt)"],
+        "rows": [],
+        "row_count": 0,
+    }
+
+
+def test_join_grouped_aggregate(join_dir):
+    result = execute(
+        str(join_dir),
+        "SELECT customers.name, count(*), sum(orders.amt), avg(orders.amt) "
+        f"{JOIN_BASE} GROUP BY customers.name",
+    )
+    assert result["columns"] == [
+        "customers.name", "count(*)", "sum(orders.amt)", "avg(orders.amt)",
+    ]
+    # Groups appear in first-appearance order over the filtered join rows.
+    assert result["rows"] == [
+        ["alpha", 3, Decimal("175.5"), Decimal("58.5")],
+        ["beta", 1, 7, 7],
+        ["gamma", 1, 9, 9],
+    ]
+    assert result["row_count"] == 3
+
+
+def test_join_grouped_bare_columns(join_dir):
+    # Bare group/aggregate columns resolve to their owning table.
+    result = execute(
+        str(join_dir),
+        f"SELECT name, count(*), sum(amt) {JOIN_BASE} GROUP BY name",
+    )
+    assert result["columns"] == ["name", "count(*)", "sum(amt)"]
+    assert result["rows"] == [
+        ["alpha", 3, Decimal("175.5")],
+        ["beta", 1, 7],
+        ["gamma", 1, 9],
+    ]
+
+
+def test_join_grouped_decimal_group_keys(join_dir):
+    # cust is 1 / 1.0 / 01 / x / 2: the three numeric spellings of 1 share
+    # one group, keyed by exact decimal value.
+    result = execute(
+        str(join_dir),
+        f"SELECT cust, count(*), sum(amt) {JOIN_BASE} GROUP BY cust",
+    )
+    assert result["rows"] == [
+        [1, 3, Decimal("175.5")],
+        ["x", 1, 7],
+        [2, 1, 9],
+    ]
+
+
+def test_join_grouped_multiple_columns_and_having(join_dir):
+    result = execute(
+        str(join_dir),
+        f"SELECT name, cust, count(*), sum(amt) {JOIN_BASE} "
+        "GROUP BY name, cust HAVING count(*) > 1 OR sum(amt) = 9",
+    )
+    assert result["rows"] == [
+        ["alpha", 1, 3, Decimal("175.5")],
+        ["gamma", 2, 1, 9],
+    ]
+
+
+def test_join_grouped_order_by_and_limit(join_dir):
+    result = execute(
+        str(join_dir),
+        f"SELECT name, count(*), sum(amt) {JOIN_BASE} "
+        "GROUP BY name ORDER BY sum(amt) DESC, name DESC LIMIT 2",
+    )
+    assert result["rows"] == [
+        ["alpha", 3, Decimal("175.5")],
+        ["gamma", 1, 9],
+    ]
+    assert result["row_count"] == 2
+    # ORDER BY may also reference the grouping column and count(*).
+    result = execute(
+        str(join_dir),
+        f"SELECT name, count(*), sum(amt) {JOIN_BASE} "
+        "GROUP BY name ORDER BY count(*), customers.name",
+    )
+    assert [r[0] for r in result["rows"]] == ["beta", "gamma", "alpha"]
+
+
+def test_join_aggregate_renders_exact_decimals(join_dir):
+    result = execute(
+        str(join_dir),
+        f"SELECT count(*), avg(orders.amt) {JOIN_BASE}",
+    )
+    assert render(result) == (
+        '{"columns":["count(*)","avg(orders.amt)"],"rows":[[5,38.3]],'
+        '"row_count":1}'
+    )
+
+
+def test_join_aggregate_non_numeric_target_raises_valueerror(join_dir):
+    with pytest.raises(ValueError):
+        execute(
+            str(join_dir),
+            f"SELECT count(*), sum(customers.name) {JOIN_BASE}",
+        )
+    # Numeric WHERE predicates validate joined rows eagerly, as before.
+    (join_dir / "bad.csv").write_text("k,v\n1,abc\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        execute(
+            str(join_dir),
+            "SELECT count(*) FROM orders INNER JOIN bad ON orders.cust = bad.k "
+            "WHERE bad.v > 0 OR orders.oid = 10",
+        )
+
+
+def test_join_aggregate_missing_column_raises_keyerror(join_dir):
+    with pytest.raises(KeyError):
+        execute(str(join_dir), f"SELECT count(*), sum(nope) {JOIN_BASE}")
+    with pytest.raises(KeyError):
+        execute(
+            str(join_dir),
+            f"SELECT nope, count(*), sum(amt) {JOIN_BASE} GROUP BY nope",
+        )
+    with pytest.raises(KeyError):
+        execute(
+            str(join_dir),
+            f"SELECT count(*), sum(orders.nope) {JOIN_BASE}",
+        )
+
+
+def test_join_aggregate_ambiguous_column_raises_valueerror(tmp_path):
+    (tmp_path / "l.csv").write_text("id,k,v\n1,1,2\n", encoding="utf-8")
+    (tmp_path / "r.csv").write_text("id,k,w\n1,1,3\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        execute(
+            str(tmp_path),
+            "SELECT count(*), sum(k) FROM l INNER JOIN r ON l.id = r.id",
+        )
+    with pytest.raises(ValueError):
+        execute(
+            str(tmp_path),
+            "SELECT k, count(*), sum(v) FROM l INNER JOIN r ON l.id = r.id "
+            "GROUP BY k",
+        )
+
+
+def test_join_aggregate_unknown_qualifier_raises_valueerror(join_dir):
+    with pytest.raises(ValueError):
+        execute(str(join_dir), f"SELECT count(*), sum(other.amt) {JOIN_BASE}")
+    with pytest.raises(ValueError):
+        execute(
+            str(join_dir),
+            f"SELECT other.name, count(*), sum(amt) {JOIN_BASE} "
+            "GROUP BY other.name",
+        )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # duplicate aggregates, as written or after resolving qualifiers
+        "SELECT count(*), sum(amt), sum(amt) " + JOIN_BASE,
+        "SELECT count(*), sum(amt), sum(orders.amt) " + JOIN_BASE,
+        # aggregate over a grouping column
+        "SELECT name, count(*), sum(name) " + JOIN_BASE + " GROUP BY name",
+        "SELECT name, count(*), min(customers.name) " + JOIN_BASE + " GROUP BY name",
+        # ungrouped SELECT mixing plain columns with aggregates
+        "SELECT count(*), name " + JOIN_BASE,
+        "SELECT count(*), sum(amt), name " + JOIN_BASE,
+        # SELECT / GROUP BY order or shape mismatch
+        "SELECT amt, count(*), sum(amt) " + JOIN_BASE + " GROUP BY name",
+        "SELECT name, count(*), sum(amt) " + JOIN_BASE + " GROUP BY customers.name",
+        "SELECT name, sum(amt) " + JOIN_BASE + " GROUP BY name",
+        "SELECT name, count(*) " + JOIN_BASE + " GROUP BY name",
+        "SELECT name, count(*), sum(amt) " + JOIN_BASE + " GROUP BY name, name",
+        # HAVING / ORDER BY must reference SELECTed aggregates
+        "SELECT count(*), sum(amt) " + JOIN_BASE + " HAVING avg(amt) > 1",
+        "SELECT count(*), sum(amt) " + JOIN_BASE + " ORDER BY avg(amt)",
+        "SELECT name, count(*), sum(amt) " + JOIN_BASE + " GROUP BY name "
+        "ORDER BY avg(amt)",
+        "SELECT name, count(*), sum(amt) " + JOIN_BASE + " GROUP BY name "
+        "ORDER BY oid",
+        # aggregate arguments are plain columns only, never expressions
+        "SELECT count(*), sum(amt + 1) " + JOIN_BASE,
+        "SELECT count(*), sum(1) " + JOIN_BASE,
+        # aliases, outer joins and multi-joins stay rejected
+        "SELECT count(*) FROM orders o INNER JOIN customers c "
+        "ON o.cust = c.cust_key",
+        "SELECT count(*) FROM orders LEFT JOIN customers ON cust = cust_key",
+        "SELECT count(*) FROM orders INNER JOIN customers ON cust = cust_key "
+        "INNER JOIN orders ON orders.oid = customers.cust_key",
+        # non-equality ON stays rejected
+        "SELECT count(*) FROM orders INNER JOIN customers ON cust > cust_key",
+    ],
+)
+def test_bad_join_aggregate_sql_raises_valueerror(join_dir, sql):
+    with pytest.raises(ValueError):
+        execute(str(join_dir), sql)
+
+
+def test_join_aggregate_cli(join_dir):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "olap_turbo",
+            "--data-dir",
+            str(join_dir),
+            "--query",
+            "SELECT name, count(*), sum(amt) FROM orders INNER JOIN customers "
+            "ON cust = cust_key GROUP BY name ORDER BY sum(amt) DESC LIMIT 1",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(proc.stdout)
+    assert payload == {
+        "columns": ["name", "count(*)", "sum(amt)"],
+        "rows": [["alpha", 3, 175.5]],
+        "row_count": 1,
     }

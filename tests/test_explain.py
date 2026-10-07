@@ -330,6 +330,154 @@ def test_explain_join_duplicate_order_by_raises_valueerror(data_dir):
         )
 
 
+# ---------- join aggregation ----------
+
+def test_join_global_aggregate_plan(data_dir):
+    plan = explain(
+        str(data_dir),
+        "SELECT count(*), sum(sales.amount), avg(amount) FROM sales "
+        "INNER JOIN regions ON sales.id = regions.rid WHERE sales.id >= 2",
+    )
+    assert list(plan.keys()) == PLAN_KEYS
+    assert plan["query_type"] == "join"
+    assert plan["tables"] == ["sales", "regions"]
+    # ON keys, the WHERE column and the aggregate argument only.
+    assert plan["scan_columns"] == ["sales.id", "sales.amount", "regions.rid"]
+    assert plan["where_columns"] == ["sales.id"]
+    assert plan["select_columns"] == []
+    assert plan["group_columns"] == []
+    assert plan["aggregates"] == [
+        {"function": "count", "column": None, "text": "count(*)"},
+        {"function": "sum", "column": "sales.amount", "text": "sum(sales.amount)"},
+        {"function": "avg", "column": "amount", "text": "avg(amount)"},
+    ]
+    assert plan["join"] == {
+        "left_table": "sales",
+        "right_table": "regions",
+        "left_column": "id",
+        "right_column": "rid",
+    }
+    assert plan["order_by"] == []
+    assert plan["limit"] is None
+
+
+def test_join_grouped_aggregate_plan(data_dir):
+    plan = explain(
+        str(data_dir),
+        "SELECT regions.city, count(*), sum(sales.amount), min(sales.id) "
+        "FROM sales INNER JOIN regions ON sales.id = regions.rid "
+        "WHERE regions.code >= 100 GROUP BY regions.city "
+        "HAVING count(*) > 1 ORDER BY sum(sales.amount) DESC LIMIT 3",
+    )
+    assert plan["query_type"] == "join"
+    # ON keys, WHERE column, grouping column and aggregate arguments.
+    assert plan["scan_columns"] == [
+        "sales.id",
+        "sales.amount",
+        "regions.rid",
+        "regions.city",
+        "regions.code",
+    ]
+    assert plan["where_columns"] == ["regions.code"]
+    assert plan["select_columns"] == ["regions.city"]
+    assert plan["group_columns"] == ["regions.city"]
+    assert plan["aggregates"] == [
+        {"function": "count", "column": None, "text": "count(*)"},
+        {"function": "sum", "column": "sales.amount", "text": "sum(sales.amount)"},
+        {"function": "min", "column": "sales.id", "text": "min(sales.id)"},
+    ]
+    assert plan["order_by"] == [
+        {"expression": "sum(sales.amount)", "direction": "DESC"}
+    ]
+    assert plan["limit"] == 3
+
+
+def test_join_aggregate_plan_reads_no_data_rows(tmp_path):
+    # Valid headers followed by non-numeric garbage rows: the plan never
+    # reads data rows, so aggregate targets and predicates cannot fail.
+    (tmp_path / "l.csv").write_text("k,v\nnot,a,row\n###\n", encoding="utf-8")
+    (tmp_path / "r.csv").write_text("k,g\n!!!\n", encoding="utf-8")
+    plan = explain(
+        str(tmp_path),
+        "SELECT g, count(*), sum(v) FROM l INNER JOIN r ON l.k = r.k "
+        "WHERE v >= 0 GROUP BY g HAVING count(*) > 1",
+    )
+    assert plan["query_type"] == "join"
+    assert plan["scan_columns"] == ["l.k", "l.v", "r.k", "r.g"]
+    assert plan["group_columns"] == ["g"]
+
+
+def test_explain_join_aggregate_errors(data_dir):
+    # Unknown aggregate argument / grouping column.
+    with pytest.raises(KeyError):
+        explain(
+            str(data_dir),
+            "SELECT count(*), sum(sales.nope) FROM sales "
+            "INNER JOIN regions ON sales.id = regions.rid",
+        )
+    with pytest.raises(KeyError):
+        explain(
+            str(data_dir),
+            "SELECT nope, count(*), sum(sales.amount) FROM sales "
+            "INNER JOIN regions ON sales.id = regions.rid GROUP BY nope",
+        )
+    # HAVING / ORDER BY aggregates absent from the SELECT list.
+    with pytest.raises(ValueError):
+        explain(
+            str(data_dir),
+            "SELECT count(*), sum(sales.amount) FROM sales "
+            "INNER JOIN regions ON sales.id = regions.rid HAVING avg(sales.amount) > 1",
+        )
+    with pytest.raises(ValueError):
+        explain(
+            str(data_dir),
+            "SELECT count(*), sum(sales.amount) FROM sales "
+            "INNER JOIN regions ON sales.id = regions.rid ORDER BY avg(sales.amount)",
+        )
+    # Duplicate aggregates after qualifier resolution.
+    with pytest.raises(ValueError):
+        explain(
+            str(data_dir),
+            "SELECT count(*), sum(amount), sum(sales.amount) FROM sales "
+            "INNER JOIN regions ON sales.id = regions.rid",
+        )
+
+
+def test_cli_explain_join_aggregate(data_dir):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "olap_turbo",
+            "--data-dir",
+            str(data_dir),
+            "--query",
+            "SELECT regions.city, count(*), sum(sales.amount) FROM sales "
+            "INNER JOIN regions ON sales.id = regions.rid "
+            "GROUP BY regions.city ORDER BY regions.city LIMIT 2",
+            "--explain",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = proc.stdout.splitlines()
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert set(payload.keys()) == set(PLAN_KEYS)
+    assert payload["query_type"] == "join"
+    assert payload["group_columns"] == ["regions.city"]
+    assert payload["aggregates"][1] == {
+        "function": "sum",
+        "column": "sales.amount",
+        "text": "sum(sales.amount)",
+    }
+    assert "rows" not in payload
+    assert "row_count" not in payload
+    assert proc.stderr == ""
+
+
 # ---------- JSON rendering ----------
 
 def test_plan_renders_as_one_json_object_without_rows(data_dir):

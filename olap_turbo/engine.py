@@ -38,9 +38,12 @@ expands to all matching right rows in right CSV order. ON keys are
 finite decimals on *both* sides match by exact decimal value (``1``
 equals ``1.0``); every other pairing matches by raw text, so a number
 never joins to text. WHERE — the same AND/OR/parentheses predicate —
-runs only after the join has fully expanded, then projection, ORDER BY
-(stable, preserving join row order) and LIMIT apply exactly as for
-single-table projections.
+runs only after the join has fully expanded. The filtered join rows then
+feed either a projection or an aggregate: a global ``count(*)`` row with
+optional ``sum``/``avg``/``min``/``max`` over joined columns, or per-group
+hash tables keyed by the GROUP BY columns (bare or ``table.column``),
+with HAVING, ORDER BY and LIMIT applied exactly as for single-table
+queries.
 
 All arithmetic and numeric comparison go through :class:`decimal.Decimal`
 so results are deterministic and free of binary-float artifacts.
@@ -70,10 +73,16 @@ BATCH_SIZE = 1024
 # Column aggregates over finite decimals, besides count(*).
 _AGG_KINDS = ("sum", "avg", "min", "max")
 
-# Aggregate state and final values are keyed by (kind, column); a state's
-# value is a running Decimal for sum/avg, the extreme Decimal so far for
-# min/max (None until a row matches).
-_AggKey = Tuple[str, str]
+# Aggregate state and final values are keyed by (kind, table, column); a
+# state's value is a running Decimal for sum/avg, the extreme Decimal so far
+# for min/max (None until a row matches). The table qualifier is None for
+# single-table queries and bare join references alike.
+_AggKey = Tuple[str, Optional[str], Optional[str]]
+
+
+def _agg_key(item: SelectItem) -> _AggKey:
+    """The state/output key of one SELECT aggregate, qualifier included."""
+    return (item.kind, item.table, item.column)
 
 
 def _decimal(field: str, column: str) -> Decimal:
@@ -188,7 +197,7 @@ def _eval_having(
         if node.kind == "count_star":
             left: Decimal = Decimal(count)
         else:
-            value = values[(node.kind, node.column)]
+            value = values[(node.kind, node.table, node.column)]
             if value is None:
                 return False
             left = value
@@ -248,9 +257,27 @@ def _new_agg_state(agg_items: Sequence[SelectItem]) -> Dict[_AggKey, Optional[De
     """
     state: Dict[_AggKey, Optional[Decimal]] = {}
     for item in agg_items:
-        key = (item.kind, item.column)
+        key = _agg_key(item)
         state[key] = None if item.kind in ("min", "max") else Decimal(0)
     return state
+
+
+def _roll(
+    state: Dict[_AggKey, Optional[Decimal]],
+    key: _AggKey,
+    kind: str,
+    value: Decimal,
+) -> None:
+    """Roll one matched row's value into one aggregate accumulator."""
+    current = state[key]
+    if kind in ("sum", "avg"):
+        state[key] = current + value
+    elif kind == "min":
+        if current is None or value < current:
+            state[key] = value
+    else:  # "max"
+        if current is None or value > current:
+            state[key] = value
 
 
 def _accumulate(
@@ -264,16 +291,7 @@ def _accumulate(
         idx = col_index[item.column]
         field = row[idx] if idx < len(row) else ""
         value = _decimal(field, item.column)
-        key = (item.kind, item.column)
-        current = state[key]
-        if item.kind in ("sum", "avg"):
-            state[key] = current + value
-        elif item.kind == "min":
-            if current is None or value < current:
-                state[key] = value
-        else:  # "max"
-            if current is None or value > current:
-                state[key] = value
+        _roll(state, _agg_key(item), item.kind, value)
 
 
 def _final_values(
@@ -289,7 +307,7 @@ def _final_values(
     """
     final: Dict[_AggKey, Optional[Decimal]] = {}
     for item in agg_items:
-        key = (item.kind, item.column)
+        key = _agg_key(item)
         value = state[key]
         if item.kind == "avg":
             final[key] = None if count == 0 else value / count
@@ -306,7 +324,7 @@ def _aggregate_result(
         if item.kind == "count_star":
             row.append(count)
         else:
-            value = values[(item.kind, item.column)]
+            value = values[_agg_key(item)]
             row.append(None if value is None else _number(value))
     return {
         "columns": [item.text for item in query.select],
@@ -332,7 +350,7 @@ def _grouped_result(
             elif item.kind == "count_star":
                 row.append(counts[key])
             else:
-                value = values[key][(item.kind, item.column)]
+                value = values[key][_agg_key(item)]
                 row.append(None if value is None else _number(value))
         rows.append(row)
     return {
@@ -656,6 +674,176 @@ def _eval_join_where(
     return _combine(node.op, vectors)
 
 
+def _join_cell(
+    pair: Tuple[Sequence[str], Sequence[str]], position: Tuple[int, int]
+) -> str:
+    """One raw cell of a joined row; short rows yield empty fields."""
+    side, idx = position
+    row = pair[side]
+    return row[idx] if idx < len(row) else ""
+
+
+def _qualified_label(table: Optional[str], column: str) -> str:
+    return column if table is None else f"{table}.{column}"
+
+
+def _resolve_join_select(
+    query: Query, resolve
+) -> Tuple[
+    List[Tuple],
+    List[Tuple[int, int]],
+    List[Tuple[SelectItem, Tuple[int, int]]],
+    List[Tuple[int, int]],
+]:
+    """Resolve every SELECT/GROUP BY column of a join query.
+
+    Returns the canonical key of each SELECT item (plain columns and
+    aggregates alike, so differently written references to the same column
+    compare equal), the plain-column positions, the (item, position)
+    aggregate entries and the grouping positions. Duplicate aggregates by
+    resolved column, duplicate grouping columns and aggregates over a
+    grouping column are ValueErrors.
+    """
+    select_keys: List[Tuple] = []
+    column_positions: List[Tuple[int, int]] = []
+    agg_entries: List[Tuple[SelectItem, Tuple[int, int]]] = []
+    for item in query.select:
+        if item.kind == "column":
+            position = resolve(item.table, item.column)
+            column_positions.append(position)
+            select_keys.append(("column", position))
+        elif item.kind == "count_star":
+            select_keys.append(("agg", "count_star", None))
+        else:
+            position = resolve(item.table, item.column)
+            agg_entries.append((item, position))
+            select_keys.append(("agg", item.kind, position))
+    seen_aggs: set = set()
+    for item, position in agg_entries:
+        key = (item.kind, position)
+        if key in seen_aggs:
+            raise ValueError(f"duplicate aggregate {item.text}")
+        seen_aggs.add(key)
+    group_positions = [resolve(ref.table, ref.name) for ref in query.group_refs]
+    if len(set(group_positions)) != len(group_positions):
+        raise ValueError("GROUP BY may not list the same column twice")
+    group_set = set(group_positions)
+    for item, position in agg_entries:
+        if position in group_set:
+            raise ValueError(
+                f"GROUP BY column {_qualified_label(item.table, item.column)} "
+                "may not be aggregated"
+            )
+    return select_keys, column_positions, agg_entries, group_positions
+
+
+def _resolve_join_order_by(
+    query: Query, resolve, select_keys: List[Tuple]
+) -> List[Tuple[int, bool]]:
+    """Map each ORDER BY item of a join query to its SELECT position.
+
+    Items match SELECT entries by resolved column, so bare and qualified
+    references to the same column are identical; duplicate items and
+    references absent from the SELECT list are ValueErrors.
+    """
+    order: List[Tuple[int, bool]] = []
+    seen: set = set()
+    for sort_item in query.order_by:
+        if sort_item.kind == "column":
+            key = ("column", resolve(sort_item.table, sort_item.column))
+        elif sort_item.kind == "count_star":
+            key = ("agg", "count_star", None)
+        else:
+            key = ("agg", sort_item.kind, resolve(sort_item.table, sort_item.column))
+        if key in seen:
+            raise ValueError(f"duplicate ORDER BY item {sort_item.text!r}")
+        seen.add(key)
+        try:
+            idx = select_keys.index(key)
+        except ValueError:
+            if sort_item.kind == "column":
+                raise ValueError(
+                    f"ORDER BY column {sort_item.text!r} is not in the "
+                    "SELECT list"
+                )
+            raise ValueError(
+                f"ORDER BY aggregate {sort_item.text} is not in the "
+                "SELECT list"
+            )
+        order.append((idx, sort_item.descending))
+    return order
+
+
+def _accumulate_join(
+    state: Dict[_AggKey, Optional[Decimal]],
+    agg_entries: Sequence[Tuple[SelectItem, Tuple[int, int]]],
+    pair: Tuple[Sequence[str], Sequence[str]],
+) -> None:
+    """Roll one matched joined row into the aggregate state."""
+    for item, position in agg_entries:
+        field = _join_cell(pair, position)
+        value = _decimal(field, _qualified_label(item.table, item.column))
+        _roll(state, _agg_key(item), item.kind, value)
+
+
+def _join_aggregate_result(
+    query: Query,
+    pairs: List[Tuple[Sequence[str], Sequence[str]]],
+    agg_entries: List[Tuple[SelectItem, Tuple[int, int]]],
+    group_positions: List[Tuple[int, int]],
+) -> Dict[str, Any]:
+    """Aggregate the filtered joined rows, globally or per group.
+
+    Mirrors the single-table scan: groups appear in first-appearance order
+    of their keys over the filtered join rows, HAVING is evaluated only
+    after every aggregate has been exactly computed, and an empty global
+    input yields count 0, sum 0 and null avg/min/max.
+    """
+    agg_items = [item for item, _ in agg_entries]
+    if query.is_grouped:
+        # First-appearance order of composite group keys over the filtered
+        # join row stream.
+        order: List[Tuple[Any, ...]] = []
+        group_counts: Dict[Tuple[Any, ...], int] = {}
+        group_states: Dict[Tuple[Any, ...], Dict[_AggKey, Optional[Decimal]]] = {}
+        for pair in pairs:
+            key = tuple(
+                _group_key(_join_cell(pair, position))
+                for position in group_positions
+            )
+            if key not in group_counts:
+                group_counts[key] = 0
+                group_states[key] = _new_agg_state(agg_items)
+                order.append(key)
+            group_counts[key] += 1
+            _accumulate_join(group_states[key], agg_entries, pair)
+        group_values = {
+            key: _final_values(agg_items, group_counts[key], group_states[key])
+            for key in order
+        }
+        if query.having is not None:
+            order = [
+                key
+                for key in order
+                if _eval_having(query.having, group_counts[key], group_values[key])
+            ]
+        return _grouped_result(query, order, group_counts, group_values)
+
+    count = 0
+    state = _new_agg_state(agg_items)
+    for pair in pairs:
+        count += 1
+        _accumulate_join(state, agg_entries, pair)
+    values = _final_values(agg_items, count, state)
+    result = _aggregate_result(query, count, values)
+    if query.having is not None and not _eval_having(query.having, count, values):
+        # A global aggregate always computes one row; HAVING failing leaves
+        # the same columns but no rows.
+        result["rows"] = []
+        result["row_count"] = 0
+    return result
+
+
 def _run_join(data_dir: str, query: Query) -> Dict[str, Any]:
     """Execute the single supported INNER JOIN query end to end."""
     left_table = query.table
@@ -685,11 +873,11 @@ def _run_join(data_dir: str, query: Query) -> Dict[str, Any]:
         field = row[right_idx] if right_idx < len(row) else ""
         right_buckets.setdefault(_join_key(field), []).append(row)
 
-    # SELECT projection positions, resolved up front so unknown/ambiguous
-    # columns fail before any row is emitted.
-    select_positions = [
-        resolve(item.table, item.column) for item in query.select
-    ]
+    # SELECT, GROUP BY and aggregate columns, resolved up front so
+    # unknown/ambiguous columns fail before any row is emitted.
+    select_keys, column_positions, agg_entries, group_positions = (
+        _resolve_join_select(query, resolve)
+    )
 
     where_positions: Dict[int, Tuple[int, int]] = {}
     if query.where is not None:
@@ -712,46 +900,31 @@ def _run_join(data_dir: str, query: Query) -> Dict[str, Any]:
         mask = _eval_join_where(query.where, pairs, where_positions)
         pairs = [pair for pair, matched in zip(pairs, mask) if matched]
 
-    projected_rows = []
-    for pair in pairs:
-        projected_rows.append(
-            [
-                _project_value(pair[side][idx] if idx < len(pair[side]) else "")
-                for side, idx in select_positions
-            ]
+    if query.is_aggregate:
+        result = _join_aggregate_result(
+            query, pairs, agg_entries, group_positions
         )
+    else:
+        projected_rows = []
+        for pair in pairs:
+            projected_rows.append(
+                [
+                    _project_value(_join_cell(pair, position))
+                    for position in column_positions
+                ]
+            )
+        result = {
+            "columns": [item.text for item in query.select],
+            "rows": projected_rows,
+            "row_count": len(projected_rows),
+        }
 
-    result: Dict[str, Any] = {
-        "columns": [item.text for item in query.select],
-        "rows": projected_rows,
-        "row_count": len(projected_rows),
-    }
-
-    # ORDER BY sorts the fully joined/filtered/projected rows; stability
-    # keeps join row order (left CSV order, then right CSV order). LIMIT
-    # truncates last.
+    # ORDER BY sorts the fully joined/filtered/aggregated rows; stability
+    # keeps the incoming order on ties (join row order for projections,
+    # first-appearance order for groups). LIMIT truncates last.
     if query.order_by:
-        # Resolve each sort item through the two headers (so bare and
-        # qualified references to the same column are identical) and map it
-        # to its position in the SELECT list.
-        order_positions = []
-        seen: set = set()
-        for sort_item in query.order_by:
-            position = resolve(sort_item.table, sort_item.column)
-            if position in seen:
-                raise ValueError(
-                    f"duplicate ORDER BY item {sort_item.text!r}"
-                )
-            seen.add(position)
-            try:
-                idx = select_positions.index(position)
-            except ValueError:
-                raise ValueError(
-                    f"ORDER BY column {sort_item.text!r} is not in the "
-                    "SELECT list"
-                )
-            order_positions.append((idx, sort_item.descending))
-        for idx, descending in reversed(order_positions):
+        order = _resolve_join_order_by(query, resolve, select_keys)
+        for idx, descending in reversed(order):
             result["rows"].sort(
                 key=lambda row, i=idx: _sort_key(row[i]), reverse=descending
             )
@@ -845,7 +1018,11 @@ def _aggregates_plan(query: Query) -> List[Dict[str, Any]]:
             )
         elif item.kind in _AGG_KINDS:
             aggregates.append(
-                {"function": item.kind, "column": item.column, "text": item.text}
+                {
+                    "function": item.kind,
+                    "column": _qualified_label(item.table, item.column),
+                    "text": item.text,
+                }
             )
     return aggregates
 
@@ -950,14 +1127,15 @@ def _explain_join(data_dir: str, query: Query) -> Dict[str, Any]:
             table, name, left_table, right_table, left_header, right_header
         )
 
-    # ON, SELECT and WHERE are resolved exactly as during execution, so an
-    # unknown/ambiguous column raises KeyError/ValueError without a row read.
+    # ON, SELECT, GROUP BY, aggregates and WHERE are resolved exactly as
+    # during execution, so an unknown/ambiguous column raises
+    # KeyError/ValueError without a row read.
     left_pos, right_pos = _resolve_on(
         query.join_on, left_table, right_table, left_header, right_header
     )
-    select_positions = [
-        resolve(item.table, item.column) for item in query.select
-    ]
+    select_keys, column_positions, agg_entries, group_positions = (
+        _resolve_join_select(query, resolve)
+    )
     where_positions: List[Tuple[int, int]] = []
     if query.where is not None:
         _collect_where_positions_ordered(
@@ -966,17 +1144,7 @@ def _explain_join(data_dir: str, query: Query) -> Dict[str, Any]:
 
     # Mirror the execution-time ORDER BY validation: duplicates by resolved
     # column and sort items absent from the SELECT list are ValueErrors.
-    order_seen: set = set()
-    for sort_item in query.order_by:
-        position = resolve(sort_item.table, sort_item.column)
-        if position in order_seen:
-            raise ValueError(f"duplicate ORDER BY item {sort_item.text!r}")
-        order_seen.add(position)
-        if position not in select_positions:
-            raise ValueError(
-                f"ORDER BY column {sort_item.text!r} is not in the "
-                "SELECT list"
-            )
+    _resolve_join_order_by(query, resolve, select_keys)
 
     headers = (left_header, right_header)
     tables = (left_table, right_table)
@@ -986,10 +1154,13 @@ def _explain_join(data_dir: str, query: Query) -> Dict[str, Any]:
         return f"{tables[side]}.{headers[side][idx]}"
 
     # Every column the join actually materializes: the two ON keys, the
-    # SELECT columns and the WHERE columns, left table first in each header's
-    # column order, then the right table.
+    # SELECT columns, the grouping and aggregate columns and the WHERE
+    # columns, left table first in each header's column order, then the
+    # right table.
     scan_set = {left_pos, right_pos}
-    scan_set.update(select_positions)
+    scan_set.update(column_positions)
+    scan_set.update(position for _, position in agg_entries)
+    scan_set.update(group_positions)
     scan_set.update(where_positions)
     scan_columns = [
         qualified((side, idx))
@@ -999,10 +1170,12 @@ def _explain_join(data_dir: str, query: Query) -> Dict[str, Any]:
 
     where_columns = [qualified(position) for position in where_positions]
 
+    # SELECT selection originals, first appearance kept (aggregates are
+    # reported separately in "aggregates").
     select_columns: List[str] = []
     seen_select: set = set()
     for item in query.select:
-        if item.text not in seen_select:
+        if item.kind == "column" and item.text not in seen_select:
             seen_select.add(item.text)
             select_columns.append(item.text)
 
@@ -1012,8 +1185,8 @@ def _explain_join(data_dir: str, query: Query) -> Dict[str, Any]:
         "scan_columns": scan_columns,
         "where_columns": where_columns,
         "select_columns": select_columns,
-        "group_columns": [],
-        "aggregates": [],
+        "group_columns": [ref.text for ref in query.group_refs],
+        "aggregates": _aggregates_plan(query),
         "join": {
             "left_table": left_table,
             "right_table": right_table,
