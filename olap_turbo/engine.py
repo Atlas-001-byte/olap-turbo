@@ -38,9 +38,22 @@ expands to all matching right rows in right CSV order. ON keys are
 finite decimals on *both* sides match by exact decimal value (``1``
 equals ``1.0``); every other pairing matches by raw text, so a number
 never joins to text. WHERE — the same AND/OR/parentheses predicate —
-runs only after the join has fully expanded, then projection, ORDER BY
-(stable, preserving join row order) and LIMIT apply exactly as for
-single-table projections.
+runs only after the join has fully expanded. From there a join query
+follows the same shapes as a single-table query: the filtered joined
+rows are either projected directly, rolled into one global aggregate
+row (``count(*)`` plus optional ``sum``/``avg``/``min``/``max`` over
+columns of either table, qualified or uniquely resolvable bare names),
+or grouped by one or more columns and aggregated per group. Grouping
+keys normalize exactly as on a single table; groups emit in their
+first-appearance order over the filtered join stream. HAVING compares
+only aggregates already selected and drops the global row or whole
+groups, then projection-equivalent ORDER BY (stable, preserving join
+row or first-appearance group order) and LIMIT apply exactly as for
+single-table queries. Every join reference — SELECT, ON, WHERE,
+GROUP BY, aggregate arguments, HAVING and ORDER BY — is resolved
+against the two headers up front, shared by execute and explain, so
+ambiguity, unknown columns and unselected HAVING/ORDER BY items fail
+before a single data row is read.
 
 All arithmetic and numeric comparison go through :class:`decimal.Decimal`
 so results are deterministic and free of binary-float artifacts.
@@ -54,6 +67,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .sql import (
+    BoolOp,
     Comparison,
     HavingComparison,
     HavingExpr,
@@ -656,8 +670,362 @@ def _eval_join_where(
     return _combine(node.op, vectors)
 
 
+# One resolved join aggregate: its SELECT index, aggregate kind and physical
+# ``(side, column_index)`` argument position (and its label for errors).
+_JoinAggSpec = Tuple[int, str, Tuple[int, int], str]
+
+
+class _JoinResolution:
+    """Every join-query reference resolved against the two CSV headers.
+
+    Built once from the parsed query and shared by execution and explain so
+    both fail on the same unknown/ambiguous columns and membership errors.
+    """
+
+    def __init__(
+        self,
+        left_pos: Tuple[int, int],
+        right_pos: Tuple[int, int],
+        select_positions: List[Optional[Tuple[int, int]]],
+        group_positions: List[Tuple[int, int]],
+        agg_specs: List[_JoinAggSpec],
+        count_star_index: Optional[int],
+        where_ordered: List[Tuple[int, int]],
+        where_by_id: Dict[int, Tuple[int, int]],
+        order_specs: List[Tuple[int, bool]],
+    ) -> None:
+        self.left_pos = left_pos
+        self.right_pos = right_pos
+        self.select_positions = select_positions
+        self.group_positions = group_positions
+        self.agg_specs = agg_specs
+        self.count_star_index = count_star_index
+        self.where_ordered = where_ordered
+        self.where_by_id = where_by_id
+        # Each ORDER BY item already mapped to its SELECT-list position.
+        self.order_specs = order_specs
+
+
+def _join_column_label(table: Optional[str], name: str) -> str:
+    return name if table is None else f"{table}.{name}"
+
+
+def _resolve_join_query(
+    query: Query,
+    left_table: str,
+    right_table: str,
+    left_header: Sequence[str],
+    right_header: Sequence[str],
+) -> _JoinResolution:
+    """Resolve SELECT/ON/WHERE/GROUP BY/HAVING/ORDER BY against the headers.
+
+    Runs before any data row is materialized, so unknown columns (KeyError),
+    ambiguous/unknown-table references, duplicate aggregates or grouping
+    columns, aggregates over a grouping column, and HAVING/ORDER BY items
+    absent from the SELECT list all fail identically during execute and
+    explain.
+    """
+
+    def resolve(table: Optional[str], name: str) -> Tuple[int, int]:
+        return _resolve_join_column(
+            table, name, left_table, right_table, left_header, right_header
+        )
+
+    left_pos, right_pos = _resolve_on(
+        query.join_on, left_table, right_table, left_header, right_header
+    )
+
+    select = query.select
+    select_positions: List[Optional[Tuple[int, int]]] = [None] * len(select)
+    agg_specs: List[_JoinAggSpec] = []
+    count_star_index: Optional[int] = None
+    for idx, item in enumerate(select):
+        if item.kind == "count_star":
+            count_star_index = idx
+        elif item.kind == "column":
+            select_positions[idx] = resolve(item.table, item.column)
+        else:  # sum/avg/min/max
+            position = resolve(item.table, item.column)
+            select_positions[idx] = position
+            label = _join_column_label(item.table, item.column)
+            agg_specs.append((idx, item.kind, position, label))
+
+    group_positions: List[Tuple[int, int]] = []
+    if query.is_grouped:
+        for table, name in zip(query.group_by_tables, query.group_by):
+            group_positions.append(resolve(table, name))
+        if len(set(group_positions)) != len(group_positions):
+            raise ValueError("GROUP BY may not list the same column twice")
+        # The leading SELECT items are the grouping columns in order; they
+        # must name the same physical columns as GROUP BY.
+        for pos, resolved in zip(group_positions, select_positions):
+            if resolved != pos:
+                raise ValueError(
+                    "SELECT grouping columns must lead the SELECT list in "
+                    "the same order as GROUP BY"
+                )
+        group_set = set(group_positions)
+        for _idx, kind, position, _label in agg_specs:
+            if position in group_set:
+                headers = (left_header, right_header)
+                side, col_idx = position
+                raise ValueError(
+                    f"GROUP BY column {headers[side][col_idx]!r} may not be "
+                    "aggregated"
+                )
+
+    # Every (kind, physical argument) pair is one distinct aggregate; two
+    # SELECT items resolving to the same one are duplicates.
+    seen_aggs: set = set()
+    for _idx, kind, position, label in agg_specs:
+        key = (kind, position)
+        if key in seen_aggs:
+            raise ValueError(f"duplicate aggregate {kind}({label})")
+        seen_aggs.add(key)
+    agg_keys = {(kind, position) for _i, kind, position, _l in agg_specs}
+
+    # WHERE columns are resolved (and deduplicated by physical column) in the
+    # written order; the id map feeds tree evaluation.
+    where_ordered: List[Tuple[int, int]] = []
+    where_by_id: Dict[int, Tuple[int, int]] = {}
+    if query.where is not None:
+        _collect_where_positions_ordered(
+            query.where, resolve, where_ordered, set()
+        )
+        _resolve_where_positions(
+            query.where,
+            where_by_id,
+            left_table,
+            right_table,
+            left_header,
+            right_header,
+        )
+
+    if query.having is not None:
+        _validate_join_having(query.having, resolve, agg_keys, count_star_index)
+
+    order_specs = _resolve_join_order_by(
+        query,
+        resolve,
+        select_positions,
+        group_positions,
+        agg_keys,
+        count_star_index,
+    )
+
+    return _JoinResolution(
+        left_pos,
+        right_pos,
+        select_positions,
+        group_positions,
+        agg_specs,
+        count_star_index,
+        where_ordered,
+        where_by_id,
+        order_specs,
+    )
+
+
+def _validate_join_having(
+    node: HavingExpr,
+    resolve,
+    agg_keys: set,
+    count_star_index: Optional[int],
+) -> None:
+    """Every join HAVING leaf must be an aggregate already in SELECT."""
+    if isinstance(node, BoolOp):
+        for operand in node.operands:
+            _validate_join_having(operand, resolve, agg_keys, count_star_index)
+        return
+    if node.kind == "count_star":
+        if count_star_index is None:
+            raise ValueError("HAVING aggregate count(*) is not in the SELECT list")
+        return
+    position = resolve(node.table, node.column)
+    if (node.kind, position) not in agg_keys:
+        raise ValueError(f"HAVING aggregate {node.text} is not in the SELECT list")
+
+
+def _resolve_join_order_by(
+    query: Query,
+    resolve,
+    select_positions: Sequence[Optional[Tuple[int, int]]],
+    group_positions: Sequence[Tuple[int, int]],
+    agg_keys: set,
+    count_star_index: Optional[int],
+) -> List[Tuple[int, bool]]:
+    """Resolve ORDER BY items to SELECT-list positions for a join query.
+
+    Projection joins match a plain column against the projected positions;
+    aggregated joins match it against the grouping columns. Aggregate items
+    and count(*) must resolve to the same aggregate selected in SELECT.
+    """
+    grouped = bool(group_positions)
+    aggregate = query.is_aggregate
+    specs: List[Tuple[int, bool]] = []
+    seen_targets: set = set()
+    for sort_item in query.order_by:
+        if sort_item.kind == "count_star":
+            if count_star_index is None:
+                raise ValueError(
+                    "ORDER BY aggregate count(*) is not in the SELECT list"
+                )
+            target: Any = ("count",)
+            select_idx = count_star_index
+        elif sort_item.kind in _AGG_KINDS:
+            position = resolve(sort_item.table, sort_item.column)
+            key = (sort_item.kind, position)
+            if key not in agg_keys:
+                raise ValueError(
+                    f"ORDER BY aggregate {sort_item.text} is not in the "
+                    "SELECT list"
+                )
+            target = ("agg",) + key
+            select_idx = next(
+                i
+                for i, item in enumerate(query.select)
+                if item.kind == sort_item.kind
+                and select_positions[i] == position
+            )
+        else:  # plain column
+            position = resolve(sort_item.table, sort_item.column)
+            if aggregate:
+                # In an aggregate query the only plain result columns are
+                # the grouping columns.
+                if position not in group_positions:
+                    raise ValueError(
+                        f"ORDER BY column {sort_item.text!r} is not in the "
+                        "SELECT list"
+                    )
+            elif position not in select_positions:
+                raise ValueError(
+                    f"ORDER BY column {sort_item.text!r} is not in the "
+                    "SELECT list"
+                )
+            target = ("column", position)
+            select_idx = select_positions.index(position)
+        if target in seen_targets:
+            raise ValueError(f"duplicate ORDER BY item {sort_item.text!r}")
+        seen_targets.add(target)
+        specs.append((select_idx, sort_item.descending))
+    return specs
+
+
+def _new_join_agg_state(agg_specs: List[_JoinAggSpec]) -> Dict[Tuple[str, Tuple[int, int]], Optional[Decimal]]:
+    """Fresh aggregate state over a joined row stream, keyed per physical col."""
+    return {
+        (kind, position): (Decimal(0) if kind in ("sum", "avg") else None)
+        for _idx, kind, position, _label in agg_specs
+    }
+
+
+def _accumulate_join(
+    state: Dict[Tuple[str, Tuple[int, int]], Optional[Decimal]],
+    agg_specs: List[_JoinAggSpec],
+    pair: Tuple[Sequence[str], Sequence[str]],
+) -> None:
+    """Roll one filtered joined row into the aggregate state."""
+    for _idx, kind, (side, idx), label in agg_specs:
+        row = pair[side]
+        field = row[idx] if idx < len(row) else ""
+        value = _decimal(field, label)
+        key = (kind, (side, idx))
+        current = state[key]
+        if kind in ("sum", "avg"):
+            state[key] = current + value
+        elif kind == "min":
+            if current is None or value < current:
+                state[key] = value
+        else:  # "max"
+            if current is None or value > current:
+                state[key] = value
+
+
+def _finalize_join_values(
+    agg_specs: List[_JoinAggSpec],
+    state: Dict[Tuple[str, Tuple[int, int]], Optional[Decimal]],
+    count: int,
+) -> Dict[Tuple[str, Tuple[int, int]], Optional[Decimal]]:
+    """Finalize join aggregate state; avg divides its exact sum by count."""
+    final: Dict[Tuple[str, Tuple[int, int]], Optional[Decimal]] = {}
+    for _idx, kind, position, _label in agg_specs:
+        key = (kind, position)
+        value = state[key]
+        if kind == "avg":
+            final[key] = None if count == 0 else value / count
+        else:
+            final[key] = value
+    return final
+
+
+def _eval_join_having(
+    node: HavingExpr,
+    count: int,
+    values: Dict[Tuple[str, Tuple[int, int]], Optional[Decimal]],
+    resolve,
+) -> bool:
+    """Evaluate a HAVING tree against one computed joined aggregate row.
+
+    As for single-table HAVING, a null aggregate (avg/min/max over an empty
+    global input) makes its comparison false and the right side is a
+    parser-validated finite decimal literal.
+    """
+    if isinstance(node, HavingComparison):
+        if node.kind == "count_star":
+            left: Decimal = Decimal(count)
+        else:
+            position = resolve(node.table, node.column)
+            value = values[(node.kind, position)]
+            if value is None:
+                return False
+            left = value
+        return _compare(left, node.op, Decimal(node.value_text))
+    if node.op == "AND":
+        return all(
+            _eval_join_having(operand, count, values, resolve)
+            for operand in node.operands
+        )
+    return any(
+        _eval_join_having(operand, count, values, resolve)
+        for operand in node.operands
+    )
+
+
+def _join_aggregate_row(
+    query: Query,
+    resolution: _JoinResolution,
+    values: Dict[Tuple[str, Tuple[int, int]], Optional[Decimal]],
+    count: int,
+    key: Optional[Tuple[Any, ...]] = None,
+) -> List[Any]:
+    """Build one output row from a join aggregate state.
+
+    A grouped row renders its leading group key values first; a global row
+    holds only count(*) and aggregates.
+    """
+    row: List[Any] = []
+    group_count = len(resolution.group_positions)
+    for idx, item in enumerate(query.select):
+        if item.kind == "count_star":
+            row.append(count)
+        elif item.kind in _AGG_KINDS:
+            value = values[(item.kind, resolution.select_positions[idx])]
+            row.append(None if value is None else _number(value))
+        elif key is not None:
+            row.append(_key_output(key[idx]))
+        else:  # pragma: no cover - parser shapes rule plain columns out here
+            row.append(None)
+    return row
+
+
 def _run_join(data_dir: str, query: Query) -> Dict[str, Any]:
-    """Execute the single supported INNER JOIN query end to end."""
+    """Execute the single supported INNER JOIN query end to end.
+
+    The joined-and-filtered row stream feeds one of three result builders,
+    exactly as for single-table queries: a plain projection, one global
+    aggregate row (count(*) plus optional sum/avg/min/max), or per-group
+    aggregates keyed by the GROUP BY columns.
+    """
     left_table = query.table
     right_table = query.join_table
     # Built-in open raises FileNotFoundError, preserving the required type;
@@ -667,15 +1035,17 @@ def _run_join(data_dir: str, query: Query) -> Dict[str, Any]:
     left_header, left_rows = _read_table(left_path)
     right_header, right_rows = _read_table(right_path)
 
+    # Every reference is resolved against the headers up front, so all
+    # unknown/ambiguous column errors fail before any row is emitted.
+    resolution = _resolve_join_query(
+        query, left_table, right_table, left_header, right_header
+    )
+    left_pos, right_pos = resolution.left_pos, resolution.right_pos
+
     def resolve(table: Optional[str], name: str) -> Tuple[int, int]:
         return _resolve_join_column(
             table, name, left_table, right_table, left_header, right_header
         )
-
-    # ON first: it uniquely defines the cross-table column pair.
-    left_pos, right_pos = _resolve_on(
-        query.join_on, left_table, right_table, left_header, right_header
-    )
 
     # Hash the right table by normalized join key; appending in CSV order
     # keeps each bucket in right-table CSV order.
@@ -685,18 +1055,8 @@ def _run_join(data_dir: str, query: Query) -> Dict[str, Any]:
         field = row[right_idx] if right_idx < len(row) else ""
         right_buckets.setdefault(_join_key(field), []).append(row)
 
-    # SELECT projection positions, resolved up front so unknown/ambiguous
-    # columns fail before any row is emitted.
-    select_positions = [
-        resolve(item.table, item.column) for item in query.select
-    ]
-
-    where_positions: Dict[int, Tuple[int, int]] = {}
-    if query.where is not None:
-        _resolve_where_positions(
-            query.where, where_positions,
-            left_table, right_table, left_header, right_header,
-        )
+    # SELECT projection and WHERE positions were resolved up front along
+    # with every other reference; resolution failures already surfaced.
 
     pairs: List[Tuple[Sequence[str], Sequence[str]]] = []
     left_idx = left_pos[1]
@@ -709,55 +1069,135 @@ def _run_join(data_dir: str, query: Query) -> Dict[str, Any]:
 
     # WHERE runs only after the join has fully expanded the rows.
     if query.where is not None:
-        mask = _eval_join_where(query.where, pairs, where_positions)
+        mask = _eval_join_where(query.where, pairs, resolution.where_by_id)
         pairs = [pair for pair, matched in zip(pairs, mask) if matched]
 
-    projected_rows = []
-    for pair in pairs:
-        projected_rows.append(
-            [
-                _project_value(pair[side][idx] if idx < len(pair[side]) else "")
-                for side, idx in select_positions
-            ]
-        )
+    if query.is_grouped:
+        result = _run_join_grouped(query, resolution, pairs, resolve)
+    elif query.is_aggregate:
+        result = _run_join_global(query, resolution, pairs, resolve)
+    else:
+        result = _run_join_projection(query, resolution, pairs)
 
-    result: Dict[str, Any] = {
+    # ORDER BY sorts the fully computed result rows; stability keeps join
+    # row order (projection) or first-appearance group order. LIMIT truncates
+    # last.
+    for select_idx, descending in reversed(resolution.order_specs):
+        result["rows"].sort(
+            key=lambda row, i=select_idx: _sort_key(row[i]), reverse=descending
+        )
+    if query.limit is not None:
+        _apply_limit(result, query.limit)
+    return result
+
+
+def _run_join_projection(
+    query: Query,
+    resolution: _JoinResolution,
+    pairs: Sequence[Tuple[Sequence[str], Sequence[str]]],
+) -> Dict[str, Any]:
+    """Project the joined rows in expansion (join) order."""
+    positions = resolution.select_positions
+    projected_rows = [
+        [
+            _project_value(pair[side][idx] if idx < len(pair[side]) else "")
+            for side, idx in positions
+        ]
+        for pair in pairs
+    ]
+    return {
         "columns": [item.text for item in query.select],
         "rows": projected_rows,
         "row_count": len(projected_rows),
     }
 
-    # ORDER BY sorts the fully joined/filtered/projected rows; stability
-    # keeps join row order (left CSV order, then right CSV order). LIMIT
-    # truncates last.
-    if query.order_by:
-        # Resolve each sort item through the two headers (so bare and
-        # qualified references to the same column are identical) and map it
-        # to its position in the SELECT list.
-        order_positions = []
-        seen: set = set()
-        for sort_item in query.order_by:
-            position = resolve(sort_item.table, sort_item.column)
-            if position in seen:
-                raise ValueError(
-                    f"duplicate ORDER BY item {sort_item.text!r}"
-                )
-            seen.add(position)
-            try:
-                idx = select_positions.index(position)
-            except ValueError:
-                raise ValueError(
-                    f"ORDER BY column {sort_item.text!r} is not in the "
-                    "SELECT list"
-                )
-            order_positions.append((idx, sort_item.descending))
-        for idx, descending in reversed(order_positions):
-            result["rows"].sort(
-                key=lambda row, i=idx: _sort_key(row[i]), reverse=descending
-            )
-    if query.limit is not None:
-        _apply_limit(result, query.limit)
+
+def _run_join_global(
+    query: Query,
+    resolution: _JoinResolution,
+    pairs: Sequence[Tuple[Sequence[str], Sequence[str]]],
+    resolve,
+) -> Dict[str, Any]:
+    """Aggregate every filtered joined row into one global row."""
+    agg_specs = resolution.agg_specs
+    state = _new_join_agg_state(agg_specs)
+    count = 0
+    for pair in pairs:
+        count += 1
+        _accumulate_join(state, agg_specs, pair)
+    values = _finalize_join_values(agg_specs, state, count)
+    result: Dict[str, Any] = {
+        "columns": [item.text for item in query.select],
+        "rows": [_join_aggregate_row(query, resolution, values, count)],
+        "row_count": 1,
+    }
+    if query.having is not None and not _eval_join_having(
+        query.having, count, values, resolve
+    ):
+        # A global aggregate always computes one row; HAVING failing leaves
+        # the same columns but no rows.
+        result["rows"] = []
+        result["row_count"] = 0
     return result
+
+
+def _run_join_grouped(
+    query: Query,
+    resolution: _JoinResolution,
+    pairs: Sequence[Tuple[Sequence[str], Sequence[str]]],
+    resolve,
+) -> Dict[str, Any]:
+    """Group the filtered joined rows and aggregate each group."""
+    agg_specs = resolution.agg_specs
+    group_positions = resolution.group_positions
+
+    # First-appearance order of composite group keys over the filtered stream
+    # of joined rows.
+    order: List[Tuple[Any, ...]] = []
+    group_counts: Dict[Tuple[Any, ...], int] = {}
+    group_states: Dict[
+        Tuple[Any, ...],
+        Dict[Tuple[str, Tuple[int, int]], Optional[Decimal]],
+    ] = {}
+    for pair in pairs:
+        key = tuple(
+            _group_key(pair[side][idx] if idx < len(pair[side]) else "")
+            for side, idx in group_positions
+        )
+        if key not in group_counts:
+            group_counts[key] = 0
+            group_states[key] = _new_join_agg_state(agg_specs)
+            order.append(key)
+        group_counts[key] += 1
+        _accumulate_join(group_states[key], agg_specs, pair)
+
+    # Finalize every group exactly before HAVING or output; each group holds
+    # at least one joined row, so its avg/min/max are never null.
+    group_values = {
+        key: _finalize_join_values(agg_specs, group_states[key], group_counts[key])
+        for key in order
+    }
+    if query.having is not None:
+        # HAVING runs after every group has been exactly computed and only
+        # drops whole groups; first-appearance order is preserved.
+        order = [
+            key
+            for key in order
+            if _eval_join_having(
+                query.having, group_counts[key], group_values[key], resolve
+            )
+        ]
+    rows = [
+        _join_aggregate_row(
+            query, resolution, group_values[key], group_counts[key], key
+        )
+        for key in order
+    ]
+    return {
+        "columns": [item.text for item in query.select],
+        "rows": rows,
+        "row_count": len(rows),
+    }
 
 
 def _dumps(obj: Any) -> str:
@@ -937,7 +1377,12 @@ def _collect_where_positions_ordered(
 
 
 def _explain_join(data_dir: str, query: Query) -> Dict[str, Any]:
-    """Plan the single INNER JOIN query; only the two CSV headers are read."""
+    """Plan the single INNER JOIN query; only the two CSV headers are read.
+
+    Projection joins and the newer global/grouped aggregate joins share one
+    resolver with execution, so GROUP BY/HAVING/aggregate/ORDER BY references
+    fail with the same KeyError/ValueError without a single data row read.
+    """
     left_table = query.table
     right_table = query.join_table
     # The left (FROM) table is opened before the right (JOIN) table, just as
@@ -945,38 +1390,10 @@ def _explain_join(data_dir: str, query: Query) -> Dict[str, Any]:
     left_header = _read_header(Path(data_dir) / f"{left_table}.csv")
     right_header = _read_header(Path(data_dir) / f"{right_table}.csv")
 
-    def resolve(table: Optional[str], name: str) -> Tuple[int, int]:
-        return _resolve_join_column(
-            table, name, left_table, right_table, left_header, right_header
-        )
-
-    # ON, SELECT and WHERE are resolved exactly as during execution, so an
-    # unknown/ambiguous column raises KeyError/ValueError without a row read.
-    left_pos, right_pos = _resolve_on(
-        query.join_on, left_table, right_table, left_header, right_header
+    resolution = _resolve_join_query(
+        query, left_table, right_table, left_header, right_header
     )
-    select_positions = [
-        resolve(item.table, item.column) for item in query.select
-    ]
-    where_positions: List[Tuple[int, int]] = []
-    if query.where is not None:
-        _collect_where_positions_ordered(
-            query.where, resolve, where_positions, set()
-        )
-
-    # Mirror the execution-time ORDER BY validation: duplicates by resolved
-    # column and sort items absent from the SELECT list are ValueErrors.
-    order_seen: set = set()
-    for sort_item in query.order_by:
-        position = resolve(sort_item.table, sort_item.column)
-        if position in order_seen:
-            raise ValueError(f"duplicate ORDER BY item {sort_item.text!r}")
-        order_seen.add(position)
-        if position not in select_positions:
-            raise ValueError(
-                f"ORDER BY column {sort_item.text!r} is not in the "
-                "SELECT list"
-            )
+    left_pos, right_pos = resolution.left_pos, resolution.right_pos
 
     headers = (left_header, right_header)
     tables = (left_table, right_table)
@@ -986,25 +1403,56 @@ def _explain_join(data_dir: str, query: Query) -> Dict[str, Any]:
         return f"{tables[side]}.{headers[side][idx]}"
 
     # Every column the join actually materializes: the two ON keys, the
-    # SELECT columns and the WHERE columns, left table first in each header's
-    # column order, then the right table.
+    # WHERE columns, the grouping columns, the aggregate argument columns and
+    # (for projection joins) the SELECT columns, left table first in each
+    # header's column order, then the right table.
     scan_set = {left_pos, right_pos}
-    scan_set.update(select_positions)
-    scan_set.update(where_positions)
+    scan_set.update(resolution.where_ordered)
+    scan_set.update(resolution.group_positions)
+    for _idx, _kind, position, _label in resolution.agg_specs:
+        scan_set.add(position)
+    for position in resolution.select_positions:
+        if position is not None:
+            scan_set.add(position)
     scan_columns = [
         qualified((side, idx))
         for side in (0, 1)
         for idx in sorted(p[1] for p in scan_set if p[0] == side)
     ]
 
-    where_columns = [qualified(position) for position in where_positions]
+    where_columns = [qualified(position) for position in resolution.where_ordered]
+    group_columns = [qualified(position) for position in resolution.group_positions]
 
+    # SELECT keeps the source text of each plain/grouping column; aggregate
+    # expressions are reported separately in "aggregates".
     select_columns: List[str] = []
     seen_select: set = set()
     for item in query.select:
-        if item.text not in seen_select:
+        if item.kind == "column" and item.text not in seen_select:
             seen_select.add(item.text)
             select_columns.append(item.text)
+
+    # Join aggregates name their physical argument column qualified, while
+    # "text" preserves the expression exactly as written (so sum(amt) and
+    # sum(orders.amt) resolving to the same column are both distinguishable
+    # in text but identical in function+column).
+    agg_position_by_idx = {
+        idx: position for idx, _kind, position, _label in resolution.agg_specs
+    }
+    aggregates: List[Dict[str, Any]] = []
+    for idx, item in enumerate(query.select):
+        if item.kind == "count_star":
+            aggregates.append(
+                {"function": "count", "column": None, "text": item.text}
+            )
+        elif item.kind in _AGG_KINDS:
+            aggregates.append(
+                {
+                    "function": item.kind,
+                    "column": qualified(agg_position_by_idx[idx]),
+                    "text": item.text,
+                }
+            )
 
     return {
         "query_type": "join",
@@ -1012,8 +1460,8 @@ def _explain_join(data_dir: str, query: Query) -> Dict[str, Any]:
         "scan_columns": scan_columns,
         "where_columns": where_columns,
         "select_columns": select_columns,
-        "group_columns": [],
-        "aggregates": [],
+        "group_columns": group_columns,
+        "aggregates": aggregates,
         "join": {
             "left_table": left_table,
             "right_table": right_table,

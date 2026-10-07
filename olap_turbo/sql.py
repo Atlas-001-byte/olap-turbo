@@ -4,11 +4,12 @@ Supported grammar (the complete surface for this baseline)::
 
     query      := SELECT select_list FROM identifier
                   [ INNER JOIN identifier ON join_on ]
-                  [ WHERE boolean ] [ GROUP BY identifier (, identifier)* ]
+                  [ WHERE boolean ] [ GROUP BY column_ref (, column_ref)* ]
                   [ HAVING having_boolean ]
                   [ ORDER BY sort_item (, sort_item)* ] [ LIMIT integer ]
     join_on    := identifier . identifier = identifier . identifier
-    sort_item  := (identifier | count_star | agg_expr) [ ASC | DESC ]
+    column_ref := identifier | identifier . identifier
+    sort_item  := (column_ref | count_star | agg_expr) [ ASC | DESC ]
     agg_expr   := sum_expr | avg_expr | min_expr | max_expr
     select_list:= grouping_column (, grouping_column)*,
                   count_star, agg_expr (, agg_expr)*   (grouped aggregate query)
@@ -39,15 +40,23 @@ A query may name at most one INNER JOIN, in the fixed position directly
 after the FROM table and before WHERE::
 
     SELECT item, item FROM left INNER JOIN right ON left.a = right.b
-    [WHERE ...] [ORDER BY ...] [LIMIT n]
+    [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT n]
 
-There are no aliases, no LEFT JOIN, no multiple joins, and a join query is a
-plain projection only: aggregates/GROUP BY/HAVING are rejected. Column
-references in the SELECT list, ON and WHERE may be table-qualified
-(``table.column``); an unqualified column is accepted only when it resolves
-uniquely across the two tables. ON must be exactly one equality of one column
-from each table: literals, two columns of the same table, any operator other
-than ``=`` and combined/duplicate conditions are rejected.
+There are no aliases, no LEFT JOIN and no multiple joins. A join query is
+either a plain projection or, just like a single-table query, a global
+aggregate (count(*) first, followed by sum/avg/min/max expressions) or a
+grouped aggregate (the GROUP BY columns leading SELECT in the same order,
+then count(*) and one or more aggregates). Every column position a
+single-table query accepts — SELECT projection and grouping columns,
+aggregate arguments, ON, WHERE, HAVING and ORDER BY — may be
+table-qualified (``table.column``); an unqualified column is accepted only
+when it resolves uniquely across the two tables. Plain projection columns,
+GROUP BY columns and HAVING/ORDER BY membership are resolved against the
+two CSV headers at execution/explain time, so ambiguity and
+unknown-table/unknown-column errors surface then rather than at parse time.
+ON must be exactly one equality of one column from each table: literals,
+two columns of the same table, any operator other than ``=`` and
+combined/duplicate conditions are rejected.
 
 AND binds tighter than OR; parentheses may be nested to override the
 precedence. Parentheses *combine* boolean conditions only: a parenthesized
@@ -64,16 +73,23 @@ sort item references a result column already in the SELECT list — a plain or
 grouping column, ``count(*)`` or one of ``sum(column)``, ``avg(column)``,
 ``min(column)``, ``max(column)`` — with an optional ``ASC`` (default) or
 ``DESC`` direction; duplicate sort items and references to expressions
-absent from the SELECT list are rejected. LIMIT takes a single non-negative
-decimal integer literal (digits only: no sign, no fraction, no strings,
-columns or expressions).
+absent from the SELECT list are rejected (join queries detect both once
+bare references have been resolved against the two headers). LIMIT takes a
+single non-negative decimal integer literal (digits only: no sign, no
+fraction, no strings, columns or expressions).
 
 A grouped query names one or more distinct grouping columns (at least two
 for the multi-column shape): they must head the SELECT list in the same
 order as the GROUP BY list, followed by count(*) and one or more distinct
-aggregate expressions (``sum``/``avg``/``min``/``max`` over a column).
-Every aggregate expression — the function name plus its column — may appear
-at most once in a SELECT list, in grouped and ungrouped queries alike.
+aggregate expressions (``sum``/``avg``/``min``/``max`` over a column, which
+in a join query may be table-qualified). The textual reference form of each
+grouping column must match between SELECT and GROUP BY (``l.a`` does not
+stand in for bare ``a``); in a join query, GROUP BY refs resolving to the
+same physical column are additionally rejected at execution/explain time.
+Every aggregate expression — the function name plus its resolved column —
+may appear at most once in a SELECT list, in grouped and ungrouped queries
+alike; in a join query two aggregates sharing a bare argument name but
+qualified by different tables are distinct.
 
 Anything else (missing FROM, NOT, functions other than
 count(*)/sum()/avg()/min()/max() in SELECT, wildcards, extra clauses,
@@ -280,6 +296,8 @@ class HavingComparison:
     op: str
     value_text: str
     column: Optional[str] = None
+    # Table qualifier of the aggregated column (join queries only).
+    table: Optional[str] = None
 
 
 HavingExpr = Union[HavingComparison, BoolOp]
@@ -326,6 +344,9 @@ class Query:
     limit: Optional[int] = None
     join_table: Optional[str] = None
     join_on: Optional[JoinOn] = None
+    # Table qualifiers parallel to ``group_by`` (join queries only; None for
+    # single-table queries and for bare GROUP BY columns).
+    group_by_tables: Tuple[Optional[str], ...] = ()
 
     @property
     def is_aggregate(self) -> bool:
@@ -417,46 +438,65 @@ class _Parser:
             tok = self._peek()
         where: Optional[WhereExpr] = None
         having: Optional[HavingExpr] = None
-        group_by: List[str] = []
+        group_refs: List[ColumnRef] = []
         order_by: List[SortItem] = []
         limit: Optional[int] = None
+        is_join = join_table is not None
         if tok.kind is _TokKind.KEYWORD and tok.text == "WHERE":
             self._next()
-            where = self._parse_or(join=True if join_table is not None else False)
+            where = self._parse_or(join=is_join)
             tok = self._peek()
         if tok.kind is _TokKind.KEYWORD and tok.text == "GROUP":
-            if join_table is not None:
-                raise ValueError("GROUP BY is not supported in a join query")
             self._next()
             self._expect_keyword("BY")
-            group_by = [self._expect(_TokKind.IDENT).text]
+            group_refs = [self._parse_column_ref()]
             while self._peek().kind is _TokKind.COMMA:
                 self._next()
-                group_by.append(self._expect(_TokKind.IDENT).text)
-            self._validate_grouped(items, group_by)
+                group_refs.append(self._parse_column_ref())
+            if is_join:
+                self._validate_join_grouped(items, group_refs)
+            else:
+                for ref in group_refs:
+                    if ref.table is not None:
+                        raise ValueError(
+                            f"table-qualified column {ref.text!r} is only "
+                            "valid in a join query"
+                        )
+                group_names = [ref.name for ref in group_refs]
+                self._validate_grouped(items, group_names)
             tok = self._peek()
-        elif join_table is not None:
-            self._validate_join(items)
+        elif is_join:
+            self._validate_join_ungrouped(items)
         else:
             self._validate_ungrouped(items)
+        group_by = [ref.name for ref in group_refs]
         if tok.kind is _TokKind.KEYWORD and tok.text == "HAVING":
-            if join_table is not None:
-                raise ValueError("HAVING is not supported in a join query")
             self._next()
-            having = self._parse_having_or()
+            having = self._parse_having_or(join=is_join)
             if not (bool(group_by) or items[0].kind == "count_star"):
                 raise ValueError("HAVING is only valid on aggregate queries")
-            self._validate_having_aggregates(having, items)
+            if not is_join:
+                self._validate_having_aggregates(having, items)
+            # For join queries the HAVING aggregates are matched to the
+            # SELECT list after bare references resolve against the two CSV
+            # headers (at execution/explain time); leaf shape and the
+            # finite-decimal right side were already checked while parsing.
             tok = self._peek()
         if tok.kind is _TokKind.KEYWORD and tok.text == "ORDER":
             self._next()
             self._expect_keyword("BY")
-            order_by = [self._parse_sort_item(items, join_table is not None)]
+            order_by = [self._parse_sort_item(items, is_join)]
             while self._peek().kind is _TokKind.COMMA:
                 self._next()
-                order_by.append(self._parse_sort_item(items, join_table is not None))
+                order_by.append(self._parse_sort_item(items, is_join))
             seen_items = set()
             for sort_item in order_by:
+                if is_join and sort_item.kind == "column":
+                    # Bare column references are resolved against the two
+                    # headers at execution/plan time, so a duplicate is only
+                    # detectable there; textual duplicates of an aggregate
+                    # expression are caught here.
+                    continue
                 key = (sort_item.table, sort_item.kind, sort_item.column)
                 if key in seen_items:
                     raise ValueError(
@@ -476,6 +516,8 @@ class _Parser:
         self._validate_qualifiers(
             items, where, order_by, table_tok.text, join_table
         )
+        if is_join:
+            self._validate_join_having_qualifiers(having, table_tok.text, join_table)
         return Query(
             tuple(items),
             table_tok.text,
@@ -486,6 +528,7 @@ class _Parser:
             limit,
             join_table,
             join_on,
+            tuple(ref.table for ref in group_refs),
         )
 
     # ----- INNER JOIN -----
@@ -552,14 +595,111 @@ class _Parser:
             return ColumnRef(second.text, first.text, f"{first.text}.{second.text}")
         return ColumnRef(first.text)
 
-    def _validate_join(self, items: List[SelectItem]) -> None:
-        """A join query is a plain projection: no aggregates at all."""
-        for item in items:
-            if item.kind != "column":
+    def _validate_join_ungrouped(self, items: List[SelectItem]) -> None:
+        """A join query without GROUP BY is a projection or a global aggregate.
+
+        The projection shape allows plain columns only; the aggregate shape
+        leads with count(*) followed by zero or more distinct
+        sum/avg/min/max expressions (whose columns may be table-qualified).
+        """
+        if items[0].kind in _AGG_KINDS:
+            raise ValueError(
+                f"{items[0].kind}(column) requires count(*) in the SELECT list"
+            )
+        aggregate = items[0].kind == "count_star"
+        seen_aggs = set()
+        for item in items[1:]:
+            if aggregate:
+                if item.kind not in _AGG_KINDS:
+                    raise ValueError(
+                        "aggregate SELECT may only contain count(*) and "
+                        "sum/avg/min/max aggregates"
+                    )
+                key = (item.kind, item.table, item.column)
+                if key in seen_aggs:
+                    raise ValueError(f"duplicate aggregate {item.text}")
+                seen_aggs.add(key)
+            elif item.kind in _AGG_KINDS:
                 raise ValueError(
-                    "aggregate SELECT expressions are not supported in a "
-                    "join query"
+                    f"{item.kind}(column) requires count(*) in the SELECT list"
                 )
+            elif item.kind != "column":
+                raise ValueError(
+                    "count(*)/aggregates cannot be mixed with plain columns"
+                )
+
+    def _validate_join_grouped(
+        self, items: List[SelectItem], group_refs: List[ColumnRef]
+    ) -> None:
+        """Enforce the grouped join shape.
+
+        As for a single-table grouped query, SELECT leads with the GROUP BY
+        columns in the same order; the reference forms may differ only in
+        qualifier spelling (``l.a`` versus bare ``a``), which execution and
+        explain confirm resolve to the same physical column. count(*) and
+        one or more distinct aggregate expressions follow. Two GROUP BY refs
+        may share a bare name when differently qualified (``l.a``, ``r.a``);
+        refs identical in qualifier and name, and refs resolving to the same
+        physical column after bare-name resolution, are rejected (the latter
+        at execution time).
+        """
+        group_keys = [(ref.table, ref.name) for ref in group_refs]
+        if len(group_keys) != len(set(group_keys)):
+            raise ValueError("GROUP BY may not list the same column twice")
+        if len(items) < len(group_refs) + 2:
+            raise ValueError(
+                "grouped SELECT must list the grouping columns followed by "
+                "count(*) and one or more aggregate expressions"
+            )
+        for pos, ref in enumerate(group_refs):
+            item = items[pos]
+            if item.kind != "column" or item.column != ref.name:
+                raise ValueError(
+                    "SELECT grouping columns must lead the SELECT list in "
+                    "the same order as GROUP BY"
+                )
+        if items[len(group_refs)].kind != "count_star":
+            raise ValueError(
+                "grouped SELECT must list count(*) after the grouping columns"
+            )
+        seen_aggs = set()
+        for item in items[len(group_refs) + 1 :]:
+            if item.kind not in _AGG_KINDS:
+                raise ValueError(
+                    "grouped SELECT may only contain the grouping columns, "
+                    "count(*) and sum/avg/min/max aggregates"
+                )
+            key = (item.kind, item.table, item.column)
+            if key in seen_aggs:
+                raise ValueError(f"duplicate aggregate {item.text}")
+            if (item.table, item.column) in group_keys:
+                raise ValueError(
+                    f"GROUP BY column {item.column} may not be aggregated"
+                )
+            seen_aggs.add(key)
+
+    def _validate_join_having_qualifiers(
+        self,
+        having: Optional[HavingExpr],
+        left_table: str,
+        join_table: str,
+    ) -> None:
+        """Check every join HAVING ``table.column`` qualifier names a table."""
+        if having is None:
+            return
+
+        def walk(node: HavingExpr) -> None:
+            if isinstance(node, BoolOp):
+                for operand in node.operands:
+                    walk(operand)
+                return
+            if node.table is not None and node.table not in (left_table, join_table):
+                raise ValueError(
+                    f"column {node.table}.{node.column} is qualified by "
+                    f"unknown table {node.table!r}"
+                )
+
+        walk(having)
 
     def _validate_qualifiers(
         self,
@@ -678,20 +818,37 @@ class _Parser:
                     "count(*)/aggregates cannot be mixed with plain columns"
                 )
 
+    def _parse_aggregate_column(self) -> Tuple[str, Optional[str], str]:
+        """Parse the argument of sum/avg/min/max: a bare or qualified column.
+
+        Returns ``(argument_text, table, name)`` where ``table`` is the
+        optional table qualifier (join queries only).
+        """
+        first = self._expect(_TokKind.IDENT)
+        if self._peek().kind is _TokKind.DOT:
+            self._next()
+            second = self._expect(_TokKind.IDENT)
+            return f"{first.text}.{second.text}", first.text, second.text
+        return first.text, None, first.text
+
     def _parse_select_item(self) -> SelectItem:
         tok = self._peek()
         # function form: ident '(' ... ')'
         if tok.kind is _TokKind.IDENT and self.tokens[self.pos + 1].kind is _TokKind.LPAREN:
             name_tok = self._next()
             self._next()  # (
+            upper = name_tok.text.upper()
+            if upper == "COUNT" and self._peek().kind is _TokKind.STAR:
+                self._next()
+                self._expect(_TokKind.RPAREN)
+                return SelectItem("count(*)", "count_star")
+            if upper in ("SUM", "AVG", "MIN", "MAX"):
+                arg_text, table, name = self._parse_aggregate_column()
+                self._expect(_TokKind.RPAREN)
+                kind = upper.lower()
+                return SelectItem(f"{kind}({arg_text})", kind, name, table)
             inner = self._next()
             self._expect(_TokKind.RPAREN)
-            upper = name_tok.text.upper()
-            if upper == "COUNT" and inner.kind is _TokKind.STAR:
-                return SelectItem("count(*)", "count_star")
-            if upper in ("SUM", "AVG", "MIN", "MAX") and inner.kind is _TokKind.IDENT:
-                kind = upper.lower()
-                return SelectItem(f"{kind}({inner.text})", kind, inner.text)
             # Any other function (count(col), median, ...) is unsupported.
             raise ValueError(
                 f"unsupported SELECT expression {name_tok.text}({inner.text})"
@@ -768,27 +925,27 @@ class _Parser:
 
     # ----- HAVING boolean grammar: aggregate op number, AND/OR/parens -----
 
-    def _parse_having_or(self) -> HavingExpr:
-        operands = [self._parse_having_and()]
+    def _parse_having_or(self, join: bool = False) -> HavingExpr:
+        operands = [self._parse_having_and(join)]
         while self._accept_keyword("OR"):
-            operands.append(self._parse_having_and())
+            operands.append(self._parse_having_and(join))
         if len(operands) == 1:
             return operands[0]
         return BoolOp("OR", tuple(operands))
 
-    def _parse_having_and(self) -> HavingExpr:
-        operands = [self._parse_having_factor()]
+    def _parse_having_and(self, join: bool = False) -> HavingExpr:
+        operands = [self._parse_having_factor(join)]
         while self._accept_keyword("AND"):
-            operands.append(self._parse_having_factor())
+            operands.append(self._parse_having_factor(join))
         if len(operands) == 1:
             return operands[0]
         return BoolOp("AND", tuple(operands))
 
-    def _parse_having_factor(self) -> HavingExpr:
+    def _parse_having_factor(self, join: bool = False) -> HavingExpr:
         tok = self._peek()
         if tok.kind is _TokKind.LPAREN:
             self._next()
-            node = self._parse_having_or()
+            node = self._parse_having_or(join)
             self._expect(_TokKind.RPAREN)
             if isinstance(node, HavingComparison):
                 # As in WHERE, parentheses only combine conditions; they
@@ -802,7 +959,7 @@ class _Parser:
             tok.kind is _TokKind.IDENT
             and self.tokens[self.pos + 1].kind is _TokKind.LPAREN
         ):
-            return self._parse_having_comparison()
+            return self._parse_having_comparison(join)
         # Plain columns/grouping columns, NOT, numbers, dangling AND/OR,
         # ')', EOF, ...: none can start a HAVING aggregate comparison.
         raise ValueError(
@@ -811,21 +968,30 @@ class _Parser:
             f"{tok.text!r}"
         )
 
-    def _parse_having_comparison(self) -> HavingComparison:
+    def _parse_having_comparison(self, join: bool = False) -> HavingComparison:
         name_tok = self._next()  # the aggregate identifier
         self._next()  # LPAREN
-        inner = self._next()
-        self._expect(_TokKind.RPAREN)
         upper = name_tok.text.upper()
-        if upper == "COUNT" and inner.kind is _TokKind.STAR:
-            text, kind, column = "count(*)", "count_star", None
-        elif upper in ("SUM", "AVG", "MIN", "MAX") and inner.kind is _TokKind.IDENT:
+        if upper == "COUNT" and self._peek().kind is _TokKind.STAR:
+            self._next()
+            self._expect(_TokKind.RPAREN)
+            text, kind, column, table = "count(*)", "count_star", None, None
+        elif upper in ("SUM", "AVG", "MIN", "MAX"):
+            arg_text, table, name = self._parse_aggregate_column()
+            self._expect(_TokKind.RPAREN)
+            if table is not None and not join:
+                raise ValueError(
+                    f"table-qualified column {arg_text!r} is only valid in a "
+                    "join query"
+                )
             kind = upper.lower()
-            text, column = f"{kind}({inner.text})", inner.text
+            text, column = f"{kind}({arg_text})", name
         else:
+            inner = self._next()
+            self._expect(_TokKind.RPAREN)
             raise ValueError(
                 "HAVING may only compare count(*) or sum/avg/min/max "
-                "aggregates"
+                f"aggregates, not {name_tok.text}({inner.text})"
             )
         op_tok = self._expect(_TokKind.OP)
         if op_tok.text not in _OPS:
@@ -837,12 +1003,12 @@ class _Parser:
             raise ValueError(
                 "HAVING comparison value must be an unquoted finite decimal number"
             )
-        return HavingComparison(text, kind, op_tok.text, val.text, column)
+        return HavingComparison(text, kind, op_tok.text, val.text, column, table)
 
     def _validate_having_aggregates(
         self, node: HavingExpr, items: List[SelectItem]
     ) -> None:
-        """Every HAVING aggregate must already appear in the SELECT list."""
+        """Every single-table HAVING aggregate must appear in SELECT."""
         if isinstance(node, BoolOp):
             for operand in node.operands:
                 self._validate_having_aggregates(operand, items)
@@ -862,24 +1028,29 @@ class _Parser:
             tok.kind is _TokKind.IDENT
             and self.tokens[self.pos + 1].kind is _TokKind.LPAREN
         ):
-            if join:
-                raise ValueError(
-                    "ORDER BY aggregates are not supported in a join query"
-                )
             name_tok = self._next()
             self._next()  # (
-            inner = self._next()
-            self._expect(_TokKind.RPAREN)
             upper = name_tok.text.upper()
-            if upper == "COUNT" and inner.kind is _TokKind.STAR:
+            if upper == "COUNT" and self._peek().kind is _TokKind.STAR:
+                self._next()
+                self._expect(_TokKind.RPAREN)
                 text, kind, column, table = "count(*)", "count_star", None, None
-            elif upper in ("SUM", "AVG", "MIN", "MAX") and inner.kind is _TokKind.IDENT:
+            elif upper in ("SUM", "AVG", "MIN", "MAX"):
+                arg_text, table, name = self._parse_aggregate_column()
+                self._expect(_TokKind.RPAREN)
+                if table is not None and not join:
+                    raise ValueError(
+                        f"table-qualified column {arg_text!r} is only valid "
+                        "in a join query"
+                    )
                 kind = upper.lower()
-                text, column, table = f"{kind}({inner.text})", inner.text, None
+                text, column = f"{kind}({arg_text})", name
             else:
+                inner = self._next()
+                self._expect(_TokKind.RPAREN)
                 raise ValueError(
                     "ORDER BY may only reference result columns, count(*) "
-                    "or sum/avg/min/max aggregates"
+                    f"or sum/avg/min/max aggregates, not {name_tok.text}({inner.text})"
                 )
         elif tok.kind is _TokKind.IDENT:
             ref = self._parse_column_ref()

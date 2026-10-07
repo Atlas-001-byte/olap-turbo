@@ -420,3 +420,171 @@ def test_cli_explain_still_requires_query(data_dir):
     )
     assert proc.returncode != 0
     assert "--query" in proc.stderr
+
+
+# ---------- post-join aggregate plans ----------
+
+def test_join_global_aggregate_plan(data_dir):
+    plan = explain(
+        str(data_dir),
+        "SELECT count(*), sum(sales.amount), avg(amount), min(regions.code) "
+        "FROM sales INNER JOIN regions ON sales.id = regions.rid "
+        "WHERE regions.city = \"NY\" HAVING count(*) > 0 AND sum(sales.amount) >= 1 "
+        "ORDER BY avg(amount) DESC, count(*) LIMIT 2",
+    )
+    assert list(plan.keys()) == PLAN_KEYS
+    assert plan["query_type"] == "join"
+    assert plan["tables"] == ["sales", "regions"]
+    # ON keys (id, rid), WHERE city, aggregate args amount/code: no plain
+    # SELECT columns, so scan_columns never widens beyond those.
+    assert plan["scan_columns"] == [
+        "sales.id",
+        "sales.amount",
+        "regions.rid",
+        "regions.city",
+        "regions.code",
+    ]
+    assert plan["where_columns"] == ["regions.city"]
+    assert plan["select_columns"] == []
+    assert plan["group_columns"] == []
+    assert plan["aggregates"] == [
+        {"function": "count", "column": None, "text": "count(*)"},
+        {"function": "sum", "column": "sales.amount", "text": "sum(sales.amount)"},
+        # The bare argument resolves against the headers and is reported
+        # qualified, while "text" keeps the original spelling.
+        {"function": "avg", "column": "sales.amount", "text": "avg(amount)"},
+        {"function": "min", "column": "regions.code", "text": "min(regions.code)"},
+    ]
+    assert plan["join"] == {
+        "left_table": "sales",
+        "right_table": "regions",
+        "left_column": "id",
+        "right_column": "rid",
+    }
+    assert plan["order_by"] == [
+        {"expression": "avg(amount)", "direction": "DESC"},
+        {"expression": "count(*)", "direction": "ASC"},
+    ]
+    assert plan["limit"] == 2
+
+
+def test_join_grouped_aggregate_plan(data_dir):
+    plan = explain(
+        str(data_dir),
+        "SELECT region, count(*), sum(amount) FROM sales "
+        "INNER JOIN regions ON id = rid WHERE code = 300 "
+        'GROUP BY region HAVING count(*) >= 1 AND sum(amount) > 0 '
+        "ORDER BY sum(amount) DESC, region LIMIT 1",
+    )
+    assert plan["query_type"] == "join"
+    assert plan["scan_columns"] == [
+        "sales.id",
+        "sales.region",
+        "sales.amount",
+        "regions.rid",
+        "regions.code",
+    ]
+    assert plan["where_columns"] == ["regions.code"]
+    assert plan["select_columns"] == ["region"]
+    assert plan["group_columns"] == ["sales.region"]
+    assert plan["aggregates"] == [
+        {"function": "count", "column": None, "text": "count(*)"},
+        {"function": "sum", "column": "sales.amount", "text": "sum(amount)"},
+    ]
+    assert plan["order_by"] == [
+        {"expression": "sum(amount)", "direction": "DESC"},
+        {"expression": "region", "direction": "ASC"},
+    ]
+    assert plan["limit"] == 1
+    # Aggregate join plans still carry no timing/row stats.
+    assert "rows" not in plan and "row_count" not in plan
+
+
+def test_join_projection_plan_fields_unchanged(data_dir):
+    # A projection join keeps empty group_columns/aggregates as before.
+    plan = explain(
+        str(data_dir),
+        "SELECT sales.id FROM sales INNER JOIN regions ON sales.id = regions.rid",
+    )
+    assert plan["query_type"] == "join"
+    assert plan["group_columns"] == []
+    assert plan["aggregates"] == []
+
+
+def test_join_aggregate_explain_reads_no_data_rows(tmp_path):
+    (tmp_path / "l.csv").write_text(
+        "id,k,v\nnot,a,row\n1,1,garbage\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "r.csv").write_text("rk\n1\n####\n", encoding="utf-8")
+    plan = explain(
+        str(tmp_path),
+        "SELECT k, count(*), sum(v), avg(v), min(v), max(v) FROM l "
+        "INNER JOIN r ON l.k = r.rk WHERE v >= 0 GROUP BY k HAVING count(*) > 0",
+    )
+    assert plan["query_type"] == "join"
+    assert plan["scan_columns"] == ["l.k", "l.v", "r.rk"]
+    assert plan["where_columns"] == ["l.v"]
+    assert plan["group_columns"] == ["l.k"]
+    assert [a["function"] for a in plan["aggregates"]] == [
+        "count", "sum", "avg", "min", "max",
+    ]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT count(*), sum(v), sum(l.v) FROM l INNER JOIN r ON l.k = r.k",
+        "SELECT name, count(*) FROM l INNER JOIN r ON l.k = r.k GROUP BY name",
+        "SELECT k, count(*), sum(l.k) FROM l INNER JOIN r ON l.k = r.k GROUP BY k",
+        "SELECT count(*) FROM l INNER JOIN r ON l.k = r.k HAVING sum(v) > 1",
+        "SELECT count(*) FROM l INNER JOIN r ON l.k = r.k ORDER BY sum(v)",
+        "SELECT count(*) FROM l INNER JOIN r ON l.k = r.k ORDER BY w",
+    ],
+)
+def test_join_aggregate_explan_bad_sql_raises_valueerror(tmp_path, sql):
+    (tmp_path / "l.csv").write_text("k,v\n1,10\n", encoding="utf-8")
+    (tmp_path / "r.csv").write_text("k,w\n1,100\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        explain(str(tmp_path), sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT count(*), sum(missing) FROM sales INNER JOIN regions ON id = rid",
+        "SELECT region, count(*), sum(missing) FROM sales INNER JOIN regions "
+        "ON id = rid GROUP BY region",
+    ],
+)
+def test_join_aggregate_explain_missing_column_raises_keyerror(data_dir, sql):
+    with pytest.raises(KeyError):
+        explain(str(data_dir), sql)
+
+
+def test_cli_explain_join_grouped(data_dir):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "olap_turbo",
+            "--data-dir",
+            str(data_dir),
+            "--query",
+            "SELECT region, count(*), sum(amount) FROM sales INNER JOIN regions "
+            "ON id = rid GROUP BY region HAVING count(*) > 0 ORDER BY sum(amount)",
+            "--explain",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(proc.stdout)
+    assert payload["query_type"] == "join"
+    assert payload["group_columns"] == ["sales.region"]
+    assert payload["aggregates"][0] == {
+        "function": "count", "column": None, "text": "count(*)",
+    }
+    assert "rows" not in payload and "row_count" not in payload
+    assert proc.stderr == ""
